@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}{{ market.question or 'Market' }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <!-- Breadcrumb -->
+    <div class="text-sm text-slate-400">
+        <a href="/markets" class="hover:text-indigo-400">Markets</a>
+        <span class="mx-2">/</span>
+        {% if market.event_id %}
+        <a href="/event/{{ market.event_id }}" class="hover:text-indigo-400">{{ market.event_title or 'Event' }}</a>
+        <span class="mx-2">/</span>
+        {% endif %}
+        <span class="text-slate-300">{{ market.question[:60] if market.question else 'Market' }}...</span>
+    </div>
+
+    <!-- Header card -->
+    <div class="bg-slate-800 rounded-xl p-6 border border-slate-700/50">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+                <h2 class="text-xl font-bold text-white">{{ market.question or '—' }}</h2>
+                <p class="text-sm text-slate-400 mt-1">{{ market.event_title or '' }}</p>
+                {% if market.event_tags %}
+                <div class="flex flex-wrap gap-2 mt-3">
+                    {% for tag in market.event_tags | parse_tags %}
+                    <span class="px-2 py-0.5 rounded-full bg-slate-700 text-xs text-slate-300">{{ tag }}</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+            <div class="flex-shrink-0">
+                <span class="pill {{ 'pill-closed' if market.closed else 'pill-open' }}">
+                    {{ 'Closed' if market.closed else 'Open' }}
+                </span>
+            </div>
+        </div>
+
+        <!-- Stats row -->
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6">
+            <div>
+                <p class="text-xs text-slate-400">Price</p>
+                <p class="text-xl font-bold text-white">{{ "%.1f" | format((market.last_trade_price or 0) * 100) }}%</p>
+            </div>
+            <div>
+                <p class="text-xs text-slate-400">Volume</p>
+                <p class="text-xl font-bold text-indigo-400" id="stat-volume">—</p>
+            </div>
+            <div>
+                <p class="text-xs text-slate-400">Liquidity</p>
+                <p class="text-xl font-bold text-cyan-400" id="stat-liquidity">—</p>
+            </div>
+            <div>
+                <p class="text-xs text-slate-400">Spread</p>
+                <p class="text-xl font-bold text-amber-400">{{ "%.1f" | format((market.spread or 0) * 100) }}%</p>
+            </div>
+            <div>
+                <p class="text-xs text-slate-400">24h Change</p>
+                <p class="text-xl font-bold {{ 'change-positive' if (market.one_day_change or 0) > 0 else 'change-negative' if (market.one_day_change or 0) < 0 else 'text-slate-400' }}">
+                    {{ "%.1f" | format((market.one_day_change or 0) * 100) }}%
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Price History</h3>
+            <div class="chart-container"><canvas id="priceChart"></canvas></div>
+            <p class="text-xs text-slate-500 mt-2" id="snapshotCount"></p>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Volume & Liquidity History</h3>
+            <div class="chart-container"><canvas id="volLiqChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Sibling markets -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <h3 class="text-sm font-semibold text-slate-300 mb-4">Markets in Same Event</h3>
+        <div class="chart-container-sm"><canvas id="siblingsChart"></canvas></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const marketId = '{{ market.id }}';
+
+document.getElementById('stat-volume').textContent = fmtUSD({{ market.volume or 0 }});
+document.getElementById('stat-liquidity').textContent = fmtUSD({{ market.liquidity or 0 }});
+
+async function loadMarketCharts() {
+    // Price history
+    const history = await fetchJSON(`/api/market/${marketId}/history`);
+    document.getElementById('snapshotCount').textContent = `${history.length} snapshots`;
+
+    if (history.length > 0) {
+        const labels = history.map(h => new Date(h.fetched_at).toLocaleDateString('en-US', {month:'short', day:'numeric'}));
+        createLineChart(document.getElementById('priceChart'), labels, [{
+            label: 'Price',
+            data: history.map(h => h.price != null ? h.price * 100 : null),
+            borderColor: COLORS.indigo,
+            backgroundColor: alpha(COLORS.indigo, 0.1),
+            fill: true,
+            tension: 0.3,
+            spanGaps: true,
+        }], { yFmt: v => v + '%' });
+
+        createLineChart(document.getElementById('volLiqChart'), labels, [
+            {
+                label: 'Volume',
+                data: history.map(h => h.volume),
+                borderColor: COLORS.cyan,
+                tension: 0.3,
+                yAxisID: 'y',
+            },
+            {
+                label: 'Liquidity',
+                data: history.map(h => h.liquidity),
+                borderColor: COLORS.amber,
+                tension: 0.3,
+                yAxisID: 'y2',
+            }
+        ], { y2: true, yFmt: fmtUSD, y2Fmt: fmtUSD });
+    }
+
+    // Sibling markets
+    const siblings = await fetchJSON(`/api/market/${marketId}/siblings`);
+    if (siblings.length > 0) {
+        createBarChart(document.getElementById('siblingsChart'),
+            siblings.map(s => s.question ? s.question.substring(0, 40) : '—'),
+            [{
+                label: 'Price',
+                data: siblings.map(s => s.last_trade_price != null ? s.last_trade_price * 100 : 0),
+                backgroundColor: siblings.map((s, i) => s.id === marketId ? COLORS.indigo : alpha(COLORS.cyan, 0.5)),
+            }],
+            { horizontal: true, xFmt: v => v + '%' }
+        );
+    }
+}
+loadMarketCharts();
+</script>
+{% endblock %}

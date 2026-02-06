@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+{% block title %}Markets{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-2xl font-bold text-white">Market Explorer</h2>
+
+    <!-- Filters -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <form id="filterForm" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Status</label>
+                <select id="f-status" class="w-full rounded-lg px-3 py-2 text-sm">
+                    <option value="">All</option>
+                    <option value="open">Open</option>
+                    <option value="closed">Closed</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Category</label>
+                <select id="f-tag" class="w-full rounded-lg px-3 py-2 text-sm">
+                    <option value="">All</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Search</label>
+                <input type="text" id="f-q" placeholder="Search markets..." class="w-full rounded-lg px-3 py-2 text-sm">
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Min Volume ($)</label>
+                <input type="number" id="f-volume-min" placeholder="0" class="w-full rounded-lg px-3 py-2 text-sm">
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Max Volume ($)</label>
+                <input type="number" id="f-volume-max" placeholder="Any" class="w-full rounded-lg px-3 py-2 text-sm">
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Min Price (%)</label>
+                <input type="number" id="f-price-min" placeholder="0" step="1" min="0" max="100" class="w-full rounded-lg px-3 py-2 text-sm">
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Max Price (%)</label>
+                <input type="number" id="f-price-max" placeholder="100" step="1" min="0" max="100" class="w-full rounded-lg px-3 py-2 text-sm">
+            </div>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Closes Within</label>
+                <select id="f-closes-within" class="w-full rounded-lg px-3 py-2 text-sm">
+                    <option value="">Any time</option>
+                    <option value="24h">24 hours</option>
+                    <option value="1w">1 week</option>
+                    <option value="1m">1 month</option>
+                    <option value="3m">3 months</option>
+                    <option value="1y">1 year</option>
+                </select>
+            </div>
+            <div class="flex items-end">
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors">
+                    Filter
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Result count -->
+    <div class="text-sm text-slate-400" id="resultCount"></div>
+
+    <!-- Markets table -->
+    <div class="bg-slate-800 rounded-xl border border-slate-700/50 overflow-hidden">
+        <div class="overflow-x-auto">
+            <table class="data-table w-full text-sm">
+                <thead>
+                    <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                        <th class="p-4 cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="question">Market</th>
+                        <th class="p-4 text-right cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="price">Price</th>
+                        <th class="p-4 text-right cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="volume">Volume</th>
+                        <th class="p-4 text-right cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="liquidity">Liquidity</th>
+                        <th class="p-4 text-right cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="spread">Spread</th>
+                        <th class="p-4 text-right cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="1d_change">1D</th>
+                        <th class="p-4 text-right cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="1w_change">1W</th>
+                        <th class="p-4 cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="end_date">Closes</th>
+                        <th class="p-4 cursor-pointer hover:text-slate-200 transition-colors select-none" data-sort="closed">Status</th>
+                    </tr>
+                </thead>
+                <tbody id="marketsBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Pagination -->
+    <div class="flex justify-center gap-2" id="pagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentSort = 'volume';
+let currentOrder = 'desc';
+let currentPage = 1;
+
+function formatEndDate(endDate) {
+    if (!endDate) return '—';
+    const d = new Date(endDate);
+    const now = new Date();
+    if (d <= now) return 'Ended';
+    const diffMs = d - now;
+    const diffDays = Math.floor(diffMs / 86400000);
+    if (diffDays < 1) {
+        const diffHrs = Math.floor(diffMs / 3600000);
+        return diffHrs <= 1 ? '< 1h' : diffHrs + 'h';
+    }
+    if (diffDays < 30) return diffDays + 'd';
+    if (diffDays < 365) return Math.floor(diffDays / 30) + 'mo';
+    return Math.floor(diffDays / 365) + 'y';
+}
+
+async function loadTags() {
+    const tags = await fetchJSON('/api/tags');
+    const sel = document.getElementById('f-tag');
+    tags.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.tag_slug;
+        opt.textContent = `${t.tag_label} (${t.event_count})`;
+        sel.appendChild(opt);
+    });
+}
+
+async function loadMarkets() {
+    const params = new URLSearchParams();
+    params.set('sort', currentSort);
+    params.set('order', currentOrder);
+    params.set('page', currentPage);
+
+    const status = document.getElementById('f-status').value;
+    const tag = document.getElementById('f-tag').value;
+    const q = document.getElementById('f-q').value;
+    const vmin = document.getElementById('f-volume-min').value;
+    const vmax = document.getElementById('f-volume-max').value;
+    const pmin = document.getElementById('f-price-min').value;
+    const pmax = document.getElementById('f-price-max').value;
+    const closesWithin = document.getElementById('f-closes-within').value;
+
+    if (status) params.set('status', status);
+    if (tag) params.set('tag', tag);
+    if (q) params.set('q', q);
+    if (vmin) params.set('volume_min', vmin);
+    if (vmax) params.set('volume_max', vmax);
+    if (pmin) params.set('price_min', pmin / 100);
+    if (pmax) params.set('price_max', pmax / 100);
+
+    if (closesWithin) {
+        const now = new Date();
+        const offsets = { '24h': 1, '1w': 7, '1m': 30, '3m': 90, '1y': 365 };
+        const days = offsets[closesWithin] || 0;
+        const endDate = new Date(now.getTime() + days * 86400000);
+        params.set('end_date_from', now.toISOString());
+        params.set('end_date_to', endDate.toISOString());
+    }
+
+    const data = await fetchJSON('/api/markets?' + params);
+
+    document.getElementById('resultCount').textContent = `${fmtNum(data.total)} markets`;
+
+    const tbody = document.getElementById('marketsBody');
+    tbody.innerHTML = data.markets.map(m => `
+        <tr class="border-b border-slate-700/30">
+            <td class="p-4 max-w-md">
+                <a href="/market/${m.id}" class="text-indigo-400 hover:text-indigo-300 block truncate">${m.question || '—'}</a>
+                <span class="text-xs text-slate-500">${m.event_title || ''}</span>
+            </td>
+            <td class="p-4 text-right font-mono text-slate-200">${m.last_trade_price != null ? fmtPct(m.last_trade_price) : '—'}</td>
+            <td class="p-4 text-right text-slate-300">${fmtUSD(m.volume)}</td>
+            <td class="p-4 text-right text-slate-300">${fmtUSD(m.liquidity)}</td>
+            <td class="p-4 text-right text-slate-300">${m.spread != null ? (m.spread * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="p-4 text-right ${m.one_day_change > 0 ? 'change-positive' : m.one_day_change < 0 ? 'change-negative' : 'text-slate-400'}">${fmtChange(m.one_day_change)}</td>
+            <td class="p-4 text-right ${m.one_week_change > 0 ? 'change-positive' : m.one_week_change < 0 ? 'change-negative' : 'text-slate-400'}">${fmtChange(m.one_week_change)}</td>
+            <td class="p-4 text-slate-400 text-xs whitespace-nowrap">${formatEndDate(m.end_date)}</td>
+            <td class="p-4"><span class="pill ${m.closed ? 'pill-closed' : 'pill-open'}">${m.closed ? 'Closed' : 'Open'}</span></td>
+        </tr>
+    `).join('');
+
+    // Pagination
+    const pag = document.getElementById('pagination');
+    let html = '';
+    const maxPages = Math.min(data.pages, 20);
+    if (data.page > 1) html += `<button class="page-btn px-3 py-1 rounded-lg bg-slate-700 text-slate-300" onclick="goPage(${data.page - 1})">Prev</button>`;
+    for (let i = 1; i <= maxPages; i++) {
+        html += `<button class="page-btn px-3 py-1 rounded-lg ${i === data.page ? 'active bg-indigo-600 text-white' : 'bg-slate-700 text-slate-300'}" onclick="goPage(${i})">${i}</button>`;
+    }
+    if (data.pages > maxPages) html += `<span class="px-2 text-slate-500">...</span>`;
+    if (data.page < data.pages) html += `<button class="page-btn px-3 py-1 rounded-lg bg-slate-700 text-slate-300" onclick="goPage(${data.page + 1})">Next</button>`;
+    pag.innerHTML = html;
+}
+
+function goPage(p) { currentPage = p; loadMarkets(); window.scrollTo(0, 0); }
+
+function updateSortIndicators() {
+    document.querySelectorAll('th[data-sort]').forEach(th => {
+        const label = th.textContent.replace(/\s*[▲▼]$/, '');
+        if (th.dataset.sort === currentSort) {
+            th.textContent = label + ' ' + (currentOrder === 'asc' ? '▲' : '▼');
+            th.classList.add('text-indigo-400');
+            th.classList.remove('text-slate-400');
+        } else {
+            th.textContent = label;
+            th.classList.remove('text-indigo-400');
+            th.classList.add('text-slate-400');
+        }
+    });
+}
+
+// Sortable column headers
+document.querySelectorAll('th[data-sort]').forEach(th => {
+    th.addEventListener('click', () => {
+        const sort = th.dataset.sort;
+        if (currentSort === sort) {
+            currentOrder = currentOrder === 'desc' ? 'asc' : 'desc';
+        } else {
+            currentSort = sort;
+            currentOrder = sort === 'question' ? 'asc' : 'desc';
+        }
+        currentPage = 1;
+        updateSortIndicators();
+        loadMarkets();
+    });
+});
+
+updateSortIndicators();
+
+// Filter form
+document.getElementById('filterForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    currentPage = 1;
+    loadMarkets();
+});
+
+loadTags();
+loadMarkets();
+</script>
+{% endblock %}

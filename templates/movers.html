@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block title %}Movers & Momentum{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-2xl font-bold text-white">Movers & Momentum</h2>
+
+    <!-- Period selector -->
+    <div class="flex gap-2">
+        <button data-period="1d" class="period-btn px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium transition-colors">Today</button>
+        <button data-period="1w" class="period-btn px-4 py-2 rounded-lg bg-slate-700 text-slate-300 text-sm font-medium transition-colors hover:bg-slate-600">This Week</button>
+        <button data-period="1m" class="period-btn px-4 py-2 rounded-lg bg-slate-700 text-slate-300 text-sm font-medium transition-colors hover:bg-slate-600">This Month</button>
+    </div>
+
+    <!-- Gainers & Losers -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-green-400 mb-4">Top Gainers</h3>
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
+                <table class="data-table w-full text-sm">
+                    <thead class="sticky top-0 bg-slate-800">
+                        <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                            <th class="pb-2 pr-4">Market</th>
+                            <th class="pb-2 pr-4 text-right">Price</th>
+                            <th class="pb-2 pr-4 text-right">Change</th>
+                            <th class="pb-2 text-right">Volume</th>
+                        </tr>
+                    </thead>
+                    <tbody id="gainersBody"></tbody>
+                </table>
+            </div>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-red-400 mb-4">Top Losers</h3>
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
+                <table class="data-table w-full text-sm">
+                    <thead class="sticky top-0 bg-slate-800">
+                        <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                            <th class="pb-2 pr-4">Market</th>
+                            <th class="pb-2 pr-4 text-right">Price</th>
+                            <th class="pb-2 pr-4 text-right">Change</th>
+                            <th class="pb-2 text-right">Volume</th>
+                        </tr>
+                    </thead>
+                    <tbody id="losersBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Price Change Distribution</h3>
+            <div class="chart-container"><canvas id="changeDistChart"></canvas></div>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Momentum Quadrant (1W vs 1D Change)</h3>
+            <div class="chart-container"><canvas id="momentumChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Newest markets -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <h3 class="text-sm font-semibold text-slate-300 mb-4">Newest Markets</h3>
+        <div class="overflow-x-auto">
+            <table class="data-table w-full text-sm">
+                <thead>
+                    <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                        <th class="pb-3 pr-4">Market</th>
+                        <th class="pb-3 pr-4 text-right">Price</th>
+                        <th class="pb-3 pr-4 text-right">Volume</th>
+                        <th class="pb-3 pr-4 text-right">Liquidity</th>
+                        <th class="pb-3 text-right">Created</th>
+                    </tr>
+                </thead>
+                <tbody id="newestBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPeriod = '1d';
+
+function renderMoversTable(data) {
+    document.getElementById('gainersBody').innerHTML = data.gainers.slice(0, 25).map(m => `
+        <tr class="border-b border-slate-700/30">
+            <td class="py-2 pr-4 max-w-xs">
+                <a href="/market/${m.id}" class="text-indigo-400 hover:text-indigo-300 block truncate text-xs">${m.question || '—'}</a>
+            </td>
+            <td class="py-2 pr-4 text-right font-mono text-slate-200 text-xs">${m.last_trade_price != null ? (m.last_trade_price * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="py-2 pr-4 text-right change-positive text-xs">${fmtChange(m.change)}</td>
+            <td class="py-2 text-right text-slate-400 text-xs">${fmtUSD(m.volume)}</td>
+        </tr>
+    `).join('');
+
+    document.getElementById('losersBody').innerHTML = data.losers.slice(0, 25).map(m => `
+        <tr class="border-b border-slate-700/30">
+            <td class="py-2 pr-4 max-w-xs">
+                <a href="/market/${m.id}" class="text-indigo-400 hover:text-indigo-300 block truncate text-xs">${m.question || '—'}</a>
+            </td>
+            <td class="py-2 pr-4 text-right font-mono text-slate-200 text-xs">${m.last_trade_price != null ? (m.last_trade_price * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="py-2 pr-4 text-right change-negative text-xs">${fmtChange(m.change)}</td>
+            <td class="py-2 text-right text-slate-400 text-xs">${fmtUSD(m.volume)}</td>
+        </tr>
+    `).join('');
+}
+
+async function loadMovers() {
+    const data = await fetchJSON(`/api/movers?period=${currentPeriod}&limit=50`);
+    renderMoversTable(data);
+}
+
+async function loadCharts() {
+    // Price change distribution
+    const changes = await fetchJSON(`/api/movers/distribution?period=${currentPeriod}`);
+    if (changes.length > 0) {
+        createBarChart(document.getElementById('changeDistChart'),
+            changes.map(c => (c.lo * 100).toFixed(0) + '%'),
+            [{
+                label: 'Markets',
+                data: changes.map(c => c.count),
+                backgroundColor: changes.map(c => c.lo >= 0 ? alpha(COLORS.green, 0.6) : alpha(COLORS.red, 0.6)),
+            }]
+        );
+    }
+
+    // Momentum quadrant
+    const momentum = await fetchJSON('/api/movers/momentum');
+    if (momentum.length > 0) {
+        const data = momentum.map(m => ({
+            x: m.one_day_change * 100,
+            y: m.one_week_change * 100,
+            r: Math.max(3, Math.min(15, Math.log10(m.volume || 1) * 2)),
+            label: m.question,
+        }));
+        new Chart(document.getElementById('momentumChart'), {
+            type: 'bubble',
+            data: {
+                datasets: [{
+                    data: data,
+                    backgroundColor: data.map(d => {
+                        if (d.x > 0 && d.y > 0) return alpha(COLORS.green, 0.5);
+                        if (d.x < 0 && d.y < 0) return alpha(COLORS.red, 0.5);
+                        return alpha(COLORS.amber, 0.5);
+                    }),
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { title: { display: true, text: '1D Change (%)' }, ticks: { callback: v => v + '%' } },
+                    y: { title: { display: true, text: '1W Change (%)' }, ticks: { callback: v => v + '%' } },
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: ctx => {
+                                const d = ctx.raw;
+                                return `${d.label?.substring(0, 50) || ''}: 1D ${d.x.toFixed(1)}%, 1W ${d.y.toFixed(1)}%`;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+async function loadNewest() {
+    const newest = await fetchJSON('/api/movers/newest');
+    document.getElementById('newestBody').innerHTML = newest.map(m => `
+        <tr class="border-b border-slate-700/30">
+            <td class="py-2 pr-4 max-w-md">
+                <a href="/market/${m.id}" class="text-indigo-400 hover:text-indigo-300 block truncate">${m.question || '—'}</a>
+                <span class="text-xs text-slate-500">${m.event_title || ''}</span>
+            </td>
+            <td class="py-2 pr-4 text-right font-mono text-slate-200">${m.last_trade_price != null ? (m.last_trade_price * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${fmtUSD(m.volume)}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${fmtUSD(m.liquidity)}</td>
+            <td class="py-2 text-right text-slate-400 text-xs">${fmtDate(m.created_at)}</td>
+        </tr>
+    `).join('');
+}
+
+// Period buttons
+document.querySelectorAll('.period-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.period-btn').forEach(b => {
+            b.classList.remove('bg-indigo-600', 'text-white');
+            b.classList.add('bg-slate-700', 'text-slate-300');
+        });
+        btn.classList.remove('bg-slate-700', 'text-slate-300');
+        btn.classList.add('bg-indigo-600', 'text-white');
+        currentPeriod = btn.dataset.period;
+        loadMovers();
+    });
+});
+
+loadMovers();
+loadCharts();
+loadNewest();
+</script>
+{% endblock %}

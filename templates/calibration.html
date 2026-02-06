@@ -1,0 +1,350 @@
+{% extends "base.html" %}
+{% block title %}Calibration{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-2xl font-bold text-white">Prediction Calibration</h2>
+
+    <!-- Data Collection Status -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4" id="overviewCards">
+        <div class="kpi-card bg-slate-800 rounded-xl p-4 border border-slate-700/50">
+            <p class="text-xs text-slate-400 uppercase tracking-wider">Resolved Markets</p>
+            <p class="text-2xl font-bold text-white mt-1" id="ov-resolved">—</p>
+        </div>
+        <div class="kpi-card bg-slate-800 rounded-xl p-4 border border-slate-700/50">
+            <p class="text-xs text-slate-400 uppercase tracking-wider">Open Markets</p>
+            <p class="text-2xl font-bold text-cyan-400 mt-1" id="ov-open">—</p>
+        </div>
+        <div class="kpi-card bg-slate-800 rounded-xl p-4 border border-slate-700/50">
+            <p class="text-xs text-slate-400 uppercase tracking-wider">Markets w/ Snapshots</p>
+            <p class="text-2xl font-bold text-indigo-400 mt-1" id="ov-with-snapshots">—</p>
+        </div>
+        <div class="kpi-card bg-slate-800 rounded-xl p-4 border border-slate-700/50">
+            <p class="text-xs text-slate-400 uppercase tracking-wider">Total Snapshots</p>
+            <p class="text-2xl font-bold text-white mt-1" id="ov-snapshots">—</p>
+        </div>
+        <div class="kpi-card bg-slate-800 rounded-xl p-4 border border-slate-700/50">
+            <p class="text-xs text-slate-400 uppercase tracking-wider">Calibration Eligible</p>
+            <p class="text-2xl font-bold text-amber-400 mt-1" id="ov-eligible">—</p>
+        </div>
+        <div class="kpi-card bg-slate-800 rounded-xl p-4 border border-slate-700/50">
+            <p class="text-xs text-slate-400 uppercase tracking-wider">Snapshot Range</p>
+            <p class="text-lg font-bold text-slate-300 mt-1" id="ov-range">—</p>
+        </div>
+    </div>
+
+    <!-- Data availability notice -->
+    <div id="dataNotice" class="hidden bg-slate-800/50 rounded-xl p-4 border border-amber-500/20">
+        <div class="flex gap-3">
+            <div class="text-amber-400 flex-shrink-0 mt-0.5">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            </div>
+            <div>
+                <p class="text-sm text-amber-300/80 font-medium">Limited Calibration Data</p>
+                <p class="text-xs text-slate-400 mt-1" id="dataNoticeText"></p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Resolution Distribution + Open Market Pricing (always available) -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-1">Resolution Price Distribution</h3>
+            <p class="text-xs text-slate-500 mb-4">Final prices of all resolved markets — most resolve decisively near 0% or 100%</p>
+            <div class="chart-container"><canvas id="resolutionDistChart"></canvas></div>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-1">Open Market Price Distribution</h3>
+            <p class="text-xs text-slate-500 mb-4">Current prices of active markets — shows market confidence distribution</p>
+            <div class="chart-container"><canvas id="openPriceChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Calibration Curve Section (shown when data exists) -->
+    <div id="calibrationSection">
+        <!-- Filters -->
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50 mb-6">
+            <h3 class="text-sm font-semibold text-slate-300 mb-3">Snapshot-Based Calibration</h3>
+            <p class="text-xs text-slate-500 mb-4">Compares earliest recorded market price against actual resolution outcome. Requires pre-resolution snapshots collected by running the data puller regularly.</p>
+            <div class="flex flex-wrap gap-4 items-end">
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">Category</label>
+                    <select id="cal-category" class="rounded-lg px-3 py-2 text-sm w-48">
+                        <option value="">All Categories</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">Min Volume ($)</label>
+                    <input type="number" id="cal-volume-min" placeholder="Any" class="rounded-lg px-3 py-2 text-sm w-32">
+                </div>
+                <button onclick="loadCalibration()" class="bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors">
+                    Apply
+                </button>
+            </div>
+        </div>
+
+        <!-- Main calibration chart -->
+        <div id="calChartContainer" class="bg-slate-800 rounded-xl p-5 border border-slate-700/50 mb-6">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">
+                Calibration Curve
+                <span class="ml-2 text-xs text-slate-500" id="calStats"></span>
+            </h3>
+            <div id="calChartArea" class="chart-container"><canvas id="calibrationChart"></canvas></div>
+            <div id="calEmptyState" class="hidden flex flex-col items-center justify-center py-12 text-center">
+                <svg class="w-12 h-12 text-slate-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                <p class="text-slate-400 text-sm font-medium">Not enough calibration data yet</p>
+                <p class="text-slate-500 text-xs mt-2 max-w-md">Calibration requires price snapshots captured while markets are still active, before they resolve. Run <code class="bg-slate-700 px-1 rounded">python3 pull_markets.py</code> regularly to collect snapshot data. As markets resolve over time, calibration data will accumulate automatically.</p>
+            </div>
+        </div>
+
+        <!-- By volume tier + Brier scores (only if data exists) -->
+        <div id="calDetailSection" class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Calibration by Volume Tier</h3>
+                <div class="chart-container"><canvas id="calByVolumeChart"></canvas></div>
+            </div>
+            <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+                <h3 class="text-sm font-semibold text-slate-300 mb-4">Brier Scores</h3>
+                <div class="overflow-x-auto">
+                    <table class="data-table w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                                <th class="pb-3 pr-4">Segment</th>
+                                <th class="pb-3 pr-4 text-right">Brier Score</th>
+                                <th class="pb-3 text-right">Sample Size</th>
+                            </tr>
+                        </thead>
+                        <tbody id="brierBody"></tbody>
+                    </table>
+                    <p class="text-xs text-slate-500 mt-3">Lower Brier score = better calibration. Perfect = 0, random guessing = 0.25</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let calChart = null;
+let calVolumeChart = null;
+let resDistChart = null;
+let openPriceChart = null;
+
+async function loadTags() {
+    const tags = await fetchJSON('/api/tags');
+    const sel = document.getElementById('cal-category');
+    tags.slice(0, 30).forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.tag_slug;
+        opt.textContent = t.tag_label;
+        sel.appendChild(opt);
+    });
+}
+
+async function loadOverview() {
+    const ov = await fetchJSON('/api/calibration/overview');
+
+    // KPI cards
+    document.getElementById('ov-resolved').textContent = fmtNum(ov.total_resolved);
+    document.getElementById('ov-open').textContent = fmtNum(ov.total_open);
+    document.getElementById('ov-with-snapshots').textContent = fmtNum(ov.total_markets_with_snapshots);
+    document.getElementById('ov-snapshots').textContent = fmtNum(ov.total_snapshots);
+
+    // Snapshot date range
+    if (ov.first_snapshot && ov.last_snapshot) {
+        const first = fmtDate(ov.first_snapshot);
+        const last = fmtDate(ov.last_snapshot);
+        document.getElementById('ov-range').textContent = first === last ? first : `${first} - ${last}`;
+    }
+
+    // Resolution distribution chart
+    const resDist = ov.resolution_distribution || [];
+    if (resDist.length > 0) {
+        if (resDistChart) resDistChart.destroy();
+        resDistChart = createBarChart(
+            document.getElementById('resolutionDistChart'),
+            resDist.map(d => d.label),
+            [{
+                label: 'Markets',
+                data: resDist.map(d => d.count),
+                backgroundColor: resDist.map((d, i) => {
+                    if (i <= 1) return alpha(COLORS.red, 0.7);
+                    if (i >= 9) return alpha(COLORS.green, 0.7);
+                    return alpha(COLORS.amber, 0.5);
+                }),
+            }],
+            { yFmt: fmtNum }
+        );
+    }
+
+    // Open market price distribution
+    const openDist = ov.open_price_distribution || [];
+    if (openDist.length > 0) {
+        if (openPriceChart) openPriceChart.destroy();
+        openPriceChart = createBarChart(
+            document.getElementById('openPriceChart'),
+            openDist.map(d => (d.lo * 100).toFixed(0) + '-' + (d.hi * 100).toFixed(0) + '%'),
+            [{
+                label: 'Markets',
+                data: openDist.map(d => d.count),
+                backgroundColor: alpha(COLORS.cyan, 0.6),
+            }],
+            { yFmt: fmtNum }
+        );
+    }
+
+    return ov;
+}
+
+async function loadCalibration() {
+    const params = new URLSearchParams();
+    const cat = document.getElementById('cal-category').value;
+    const volMin = document.getElementById('cal-volume-min').value;
+    if (cat) params.set('category', cat);
+    if (volMin) params.set('volume_min', volMin);
+
+    const data = await fetchJSON('/api/calibration?' + params);
+
+    // Update eligible count
+    document.getElementById('ov-eligible').textContent = fmtNum(data.count);
+
+    const hasData = data.count > 0 && data.bins.some(b => b.count > 0);
+
+    // Show/hide empty state
+    if (!hasData) {
+        document.getElementById('calChartArea').classList.add('hidden');
+        document.getElementById('calEmptyState').classList.remove('hidden');
+        document.getElementById('calDetailSection').classList.add('hidden');
+
+        // Show data notice
+        const notice = document.getElementById('dataNotice');
+        notice.classList.remove('hidden');
+        document.getElementById('dataNoticeText').textContent =
+            'Calibration requires pre-resolution price snapshots. Currently there are not enough markets with both snapshot data and resolved outcomes. ' +
+            'Run pull_markets.py on a regular schedule (e.g. daily) to build up snapshot history. As tracked markets resolve, calibration data will appear here automatically.';
+
+        // Stats
+        document.getElementById('calStats').textContent = `${data.count} eligible markets`;
+        return;
+    }
+
+    // Has data — show calibration
+    document.getElementById('calChartArea').classList.remove('hidden');
+    document.getElementById('calEmptyState').classList.add('hidden');
+    document.getElementById('calDetailSection').classList.remove('hidden');
+    document.getElementById('dataNotice').classList.add('hidden');
+
+    // Stats
+    document.getElementById('calStats').textContent =
+        `${fmtNum(data.count)} markets | Brier: ${data.brier_score != null ? data.brier_score.toFixed(4) : '—'}`;
+
+    // Main calibration curve
+    if (calChart) calChart.destroy();
+    const bins = data.bins.filter(b => b.count > 0);
+    calChart = new Chart(document.getElementById('calibrationChart'), {
+        type: 'scatter',
+        data: {
+            datasets: [
+                {
+                    label: 'Actual Resolution Rate',
+                    data: bins.map(b => ({ x: b.avg_predicted, y: b.avg_actual })),
+                    backgroundColor: COLORS.indigo,
+                    pointRadius: bins.map(b => Math.max(4, Math.min(12, Math.sqrt(b.count) / 2))),
+                    showLine: true,
+                    borderColor: COLORS.indigo,
+                    borderWidth: 2,
+                    tension: 0.3,
+                },
+                {
+                    label: 'Perfect Calibration',
+                    data: [{x: 0, y: 0}, {x: 1, y: 1}],
+                    borderColor: 'rgba(148, 163, 184, 0.3)',
+                    borderDash: [5, 5],
+                    showLine: true,
+                    pointRadius: 0,
+                    borderWidth: 1,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { min: 0, max: 1, title: { display: true, text: 'Predicted Probability' }, ticks: { callback: v => (v * 100) + '%' } },
+                y: { min: 0, max: 1, title: { display: true, text: 'Actual Resolution Rate' }, ticks: { callback: v => (v * 100) + '%' } },
+            },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        label: ctx => {
+                            if (ctx.datasetIndex === 1) return '';
+                            const b = bins[ctx.dataIndex];
+                            return `Predicted: ${(b.avg_predicted * 100).toFixed(1)}% | Actual: ${(b.avg_actual * 100).toFixed(1)}% | n=${b.count}`;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // By volume tier
+    const byVolume = data.by_volume_tier || {};
+    const tierLabels = Object.keys(byVolume);
+    if (calVolumeChart) calVolumeChart.destroy();
+    if (tierLabels.length > 0) {
+        const datasets = tierLabels.map((tier, i) => {
+            const tierBins = byVolume[tier].bins.filter(b => b.count > 0);
+            return {
+                label: tier,
+                data: tierBins.map(b => ({ x: b.avg_predicted, y: b.avg_actual })),
+                borderColor: PALETTE[i % PALETTE.length],
+                showLine: true,
+                borderWidth: 2,
+                tension: 0.3,
+                pointRadius: 4,
+            };
+        });
+        datasets.push({
+            label: 'Perfect',
+            data: [{x: 0, y: 0}, {x: 1, y: 1}],
+            borderColor: 'rgba(148, 163, 184, 0.2)',
+            borderDash: [5, 5],
+            showLine: true,
+            pointRadius: 0,
+            borderWidth: 1,
+        });
+        calVolumeChart = new Chart(document.getElementById('calByVolumeChart'), {
+            type: 'scatter',
+            data: { datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { min: 0, max: 1, title: { display: true, text: 'Predicted Probability' }, ticks: { callback: v => (v * 100) + '%' } },
+                    y: { min: 0, max: 1, title: { display: true, text: 'Actual Resolution Rate' }, ticks: { callback: v => (v * 100) + '%' } },
+                },
+                plugins: { legend: { display: true } },
+            }
+        });
+    }
+
+    // Brier score table
+    const brierBody = document.getElementById('brierBody');
+    let rows = [{ label: 'Overall', brier: data.brier_score, count: data.count }];
+    for (const [tier, cal] of Object.entries(byVolume)) {
+        rows.push({ label: tier, brier: cal.brier_score, count: cal.count });
+    }
+    brierBody.innerHTML = rows.map(r => `
+        <tr class="border-b border-slate-700/30">
+            <td class="py-2 pr-4 text-slate-200">${r.label}</td>
+            <td class="py-2 pr-4 text-right font-mono text-slate-300">${r.brier != null ? r.brier.toFixed(4) : '—'}</td>
+            <td class="py-2 text-right text-slate-400">${fmtNum(r.count)}</td>
+        </tr>
+    `).join('');
+}
+
+loadTags();
+loadOverview().then(() => loadCalibration());
+</script>
+{% endblock %}

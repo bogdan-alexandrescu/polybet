@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Categories{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-2xl font-bold text-white">Category Analytics</h2>
+
+    <!-- Category bar chart -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <h3 class="text-sm font-semibold text-slate-300 mb-4">Categories by Volume</h3>
+        <div class="chart-container"><canvas id="categoryBarChart"></canvas></div>
+    </div>
+
+    <!-- Category growth + resolution rates -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Category Growth (Top 10)</h3>
+            <div class="chart-container"><canvas id="categoryGrowthChart"></canvas></div>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Resolution Rates by Category</h3>
+            <div class="chart-container"><canvas id="resolutionRateChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Category table -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <h3 class="text-sm font-semibold text-slate-300 mb-4">All Categories</h3>
+        <div class="overflow-x-auto">
+            <table class="data-table w-full text-sm">
+                <thead>
+                    <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                        <th class="pb-3 pr-4">Category</th>
+                        <th class="pb-3 pr-4 text-right">Events</th>
+                        <th class="pb-3 pr-4 text-right">Markets</th>
+                        <th class="pb-3 pr-4 text-right">Volume</th>
+                        <th class="pb-3 pr-4 text-right">Avg Spread</th>
+                        <th class="pb-3 pr-4 text-right">Avg Liquidity</th>
+                        <th class="pb-3 text-right">Resolved</th>
+                    </tr>
+                </thead>
+                <tbody id="categoryBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadCategories() {
+    const cats = await fetchJSON('/api/categories?sort=volume');
+    const top20 = cats.slice(0, 20);
+
+    // Bar chart
+    createBarChart(document.getElementById('categoryBarChart'),
+        top20.map(c => c.tag_label),
+        [{
+            label: 'Volume',
+            data: top20.map(c => c.total_volume),
+            backgroundColor: PALETTE.map(c => alpha(c, 0.7)),
+        }],
+        { horizontal: true, xFmt: fmtUSD }
+    );
+
+    // Table
+    const tbody = document.getElementById('categoryBody');
+    tbody.innerHTML = cats.map(c => `
+        <tr class="border-b border-slate-700/30">
+            <td class="py-2 pr-4 text-slate-200 font-medium">${c.tag_label}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${fmtNum(c.event_count)}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${fmtNum(c.market_count)}</td>
+            <td class="py-2 pr-4 text-right text-indigo-400">${fmtUSD(c.total_volume)}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${c.avg_spread != null ? (c.avg_spread * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${fmtUSD(c.avg_liquidity)}</td>
+            <td class="py-2 text-right text-slate-300">${fmtNum(c.resolved_count)}</td>
+        </tr>
+    `).join('');
+
+    // Category growth
+    const growth = await fetchJSON('/api/categories/growth');
+    if (growth.periods && growth.series) {
+        const datasets = growth.series.map((s, i) => ({
+            label: s.tag,
+            data: s.data,
+            borderColor: PALETTE[i % PALETTE.length],
+            backgroundColor: alpha(PALETTE[i % PALETTE.length], 0.1),
+            fill: true,
+            tension: 0.3,
+        }));
+        createLineChart(document.getElementById('categoryGrowthChart'),
+            growth.periods, datasets,
+            { yFmt: fmtUSD }
+        );
+    }
+
+    // Resolution rates
+    const resRates = await fetchJSON('/api/categories/resolution_rates');
+    const topRes = resRates.slice(0, 15);
+    if (topRes.length > 0) {
+        createBarChart(document.getElementById('resolutionRateChart'),
+            topRes.map(r => r.tag_label),
+            [
+                {
+                    label: 'Resolved Yes',
+                    data: topRes.map(r => r.resolved_yes),
+                    backgroundColor: alpha(COLORS.green, 0.7),
+                },
+                {
+                    label: 'Resolved No',
+                    data: topRes.map(r => r.resolved_no),
+                    backgroundColor: alpha(COLORS.red, 0.7),
+                },
+            ],
+            { stacked: true, horizontal: true }
+        );
+    }
+}
+loadCategories();
+</script>
+{% endblock %}

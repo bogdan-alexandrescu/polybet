@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}Volume Analytics{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <h2 class="text-2xl font-bold text-white">Volume Analytics</h2>
+
+    <!-- Monthly volume timeline -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <h3 class="text-sm font-semibold text-slate-300 mb-4">Monthly Volume</h3>
+        <div class="chart-container"><canvas id="monthlyVolumeChart"></canvas></div>
+    </div>
+
+    <!-- Distribution + scatter -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Volume Distribution (Log Scale)</h3>
+            <div class="chart-container"><canvas id="volumeHistChart"></canvas></div>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Volume vs Liquidity</h3>
+            <div class="chart-container"><canvas id="volLiqScatter"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Lorenz + Volume vs Spread -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">
+                Volume Concentration (Lorenz Curve)
+                <span class="ml-2 text-xs text-slate-500" id="giniLabel"></span>
+            </h3>
+            <div class="chart-container"><canvas id="lorenzChart"></canvas></div>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+            <h3 class="text-sm font-semibold text-slate-300 mb-4">Volume vs Spread</h3>
+            <div class="chart-container"><canvas id="volSpreadScatter"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Top 50 markets -->
+    <div class="bg-slate-800 rounded-xl p-5 border border-slate-700/50">
+        <h3 class="text-sm font-semibold text-slate-300 mb-4">Top 50 Markets by Volume</h3>
+        <div class="overflow-x-auto">
+            <table class="data-table w-full text-sm">
+                <thead>
+                    <tr class="text-left text-slate-400 border-b border-slate-700/50 text-xs uppercase tracking-wider">
+                        <th class="pb-3 pr-4">#</th>
+                        <th class="pb-3 pr-4">Market</th>
+                        <th class="pb-3 pr-4 text-right">Volume</th>
+                        <th class="pb-3 pr-4 text-right">Liquidity</th>
+                        <th class="pb-3 pr-4 text-right">Spread</th>
+                        <th class="pb-3 pr-4 text-right">Price</th>
+                        <th class="pb-3">Status</th>
+                    </tr>
+                </thead>
+                <tbody id="topMarketsBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadVolumeAnalytics() {
+    // Monthly volume
+    const monthly = await fetchJSON('/api/volume/monthly');
+    createAreaChart(document.getElementById('monthlyVolumeChart'),
+        monthly.map(m => m.period),
+        [{
+            label: 'Volume',
+            data: monthly.map(m => m.total_volume),
+            borderColor: COLORS.indigo,
+        }],
+        { yFmt: fmtUSD }
+    );
+
+    // Volume distribution histogram
+    const dist = await fetchJSON('/api/volume/distribution');
+    createBarChart(document.getElementById('volumeHistChart'),
+        dist.map(d => fmtUSD(d.lo)),
+        [{
+            label: 'Markets',
+            data: dist.map(d => d.count),
+            backgroundColor: alpha(COLORS.cyan, 0.6),
+        }]
+    );
+
+    // Volume vs liquidity scatter
+    const scatter1 = await fetchJSON('/api/volume/scatter?x=volume&y=liquidity&sample=3000');
+    createScatterChart(document.getElementById('volLiqScatter'),
+        scatter1.map(d => ({ x: d.x, y: d.y })),
+        {
+            logX: true, logY: true, color: COLORS.indigo,
+            xLabel: 'Volume ($)', yLabel: 'Liquidity ($)',
+            xFmt: fmtUSD, yFmt: fmtUSD,
+            tooltipFmt: ctx => `Vol: ${fmtUSD(ctx.raw.x)} | Liq: ${fmtUSD(ctx.raw.y)}`
+        }
+    );
+
+    // Volume vs spread scatter
+    const scatter2 = await fetchJSON('/api/volume/scatter?x=volume&y=spread&sample=3000');
+    createScatterChart(document.getElementById('volSpreadScatter'),
+        scatter2.map(d => ({ x: d.x, y: d.y })),
+        {
+            logX: true, color: COLORS.amber,
+            xLabel: 'Volume ($)', yLabel: 'Spread',
+            xFmt: fmtUSD, yFmt: v => (v * 100).toFixed(0) + '%',
+            tooltipFmt: ctx => `Vol: ${fmtUSD(ctx.raw.x)} | Spread: ${(ctx.raw.y * 100).toFixed(1)}%`
+        }
+    );
+
+    // Lorenz curve
+    const lorenz = await fetchJSON('/api/volume/lorenz');
+    document.getElementById('giniLabel').textContent = `Gini: ${lorenz.gini.toFixed(4)}`;
+    const lorenzCtx = document.getElementById('lorenzChart');
+    new Chart(lorenzCtx, {
+        type: 'scatter',
+        data: {
+            datasets: [
+                {
+                    label: 'Lorenz Curve',
+                    data: lorenz.curve,
+                    borderColor: COLORS.indigo,
+                    backgroundColor: alpha(COLORS.indigo, 0.1),
+                    showLine: true,
+                    fill: true,
+                    pointRadius: 0,
+                    borderWidth: 2,
+                },
+                {
+                    label: 'Perfect Equality',
+                    data: [{x: 0, y: 0}, {x: 1, y: 1}],
+                    borderColor: 'rgba(148, 163, 184, 0.3)',
+                    borderDash: [5, 5],
+                    showLine: true,
+                    pointRadius: 0,
+                    borderWidth: 1,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { title: { display: true, text: 'Cumulative % of Markets' }, min: 0, max: 1, ticks: { callback: v => (v * 100) + '%' } },
+                y: { title: { display: true, text: 'Cumulative % of Volume' }, min: 0, max: 1, ticks: { callback: v => (v * 100) + '%' } },
+            },
+            plugins: { legend: { display: true } },
+        }
+    });
+
+    // Top 50 markets
+    const topMarkets = await fetchJSON('/api/volume/top');
+    const tbody = document.getElementById('topMarketsBody');
+    tbody.innerHTML = topMarkets.map((m, i) => `
+        <tr class="border-b border-slate-700/30">
+            <td class="py-2 pr-4 text-slate-500">${i + 1}</td>
+            <td class="py-2 pr-4 max-w-md">
+                <a href="/market/${m.id}" class="text-indigo-400 hover:text-indigo-300 block truncate">${m.question || '—'}</a>
+                <span class="text-xs text-slate-500">${m.event_title || ''}</span>
+            </td>
+            <td class="py-2 pr-4 text-right text-indigo-400 font-medium">${fmtUSD(m.volume)}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${fmtUSD(m.liquidity)}</td>
+            <td class="py-2 pr-4 text-right text-slate-300">${m.spread != null ? (m.spread * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="py-2 pr-4 text-right font-mono text-slate-200">${m.last_trade_price != null ? (m.last_trade_price * 100).toFixed(1) + '%' : '—'}</td>
+            <td class="py-2"><span class="pill ${m.closed ? 'pill-closed' : 'pill-open'}">${m.closed ? 'Closed' : 'Open'}</span></td>
+        </tr>
+    `).join('');
+}
+loadVolumeAnalytics();
+</script>
+{% endblock %}
