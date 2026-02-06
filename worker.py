@@ -13,8 +13,29 @@ from pull_markets import init_db
 from db import get_connection, return_connection
 from scheduler import start_scheduler, stop_scheduler
 
+MAX_RETRIES = 10
+RETRY_DELAY = 5
+
+
+def wait_for_db():
+    """Wait for the database to become available with retries."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            conn = get_connection()
+            conn.execute("SELECT 1")
+            return_connection(conn)
+            print("Database connection established.")
+            return
+        except Exception as e:
+            print(f"DB connection attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+    raise RuntimeError(f"Could not connect to database after {MAX_RETRIES} attempts")
+
 
 def main():
+    wait_for_db()
+
     # Ensure tables exist
     conn = get_connection()
     try:

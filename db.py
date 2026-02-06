@@ -22,6 +22,7 @@ def get_pool():
             DATABASE_URL,
             min_size=2,
             max_size=10,
+            open=True,
             kwargs={"row_factory": dict_row},
         )
     return _pool
@@ -83,7 +84,10 @@ def create_tag_table(conn):
 
 
 def init_analytics_db():
-    """Run all startup initialization (indexes + tag table + settings table)."""
+    """Run all startup initialization (indexes + tag table + settings table).
+
+    Resilient to missing tables on fresh deploys — logs warnings instead of crashing.
+    """
     conn = get_connection()
     try:
         # Create settings table if not exists
@@ -96,6 +100,16 @@ def init_analytics_db():
         """)
         conn.commit()
 
+        # Check if core tables exist before creating indexes/tags
+        has_tables = conn.execute("""
+            SELECT COUNT(*) AS cnt FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name IN ('events', 'markets', 'price_snapshots')
+        """).fetchone()["cnt"]
+
+        if has_tables < 3:
+            print("Core tables not yet created — skipping indexes and tag table.")
+            return
+
         print("Creating analytics indexes...")
         t0 = time.time()
         create_indexes(conn)
@@ -106,5 +120,11 @@ def init_analytics_db():
         create_tag_table(conn)
         count = conn.execute("SELECT COUNT(*) AS cnt FROM event_tags").fetchone()["cnt"]
         print(f"  Tag table populated with {count:,} rows in {time.time() - t0:.1f}s")
+    except Exception as e:
+        print(f"Warning: init_analytics_db failed: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     finally:
         return_connection(conn)

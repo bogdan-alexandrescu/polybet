@@ -101,7 +101,11 @@ def create_app():
             return_connection(conn)
 
     with app.app_context():
-        init_analytics_db()
+        try:
+            init_analytics_db()
+        except Exception as e:
+            print(f"Warning: DB init failed on startup: {e}")
+            print("App will start anyway — tables will be created on first refresh.")
 
     # -------------------------------------------------------------------
     # Page routes
