@@ -227,7 +227,7 @@ def run_refresh(source="web"):
             "updated_markets": 0,
             "snapshots": 0,
         }
-        flush_interval = 50
+        flush_interval = 10
 
         for i, event in enumerate(all_events):
             if is_cancelled(state_conn, job_id):

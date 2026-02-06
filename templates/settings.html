@@ -83,7 +83,7 @@
                 <!-- Stats Grid -->
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
                     <div class="bg-slate-900/50 rounded-lg p-3">
-                        <p class="text-xs text-slate-500">Events Processed</p>
+                        <p id="statEventsLabel" class="text-xs text-slate-500">Events Processed</p>
                         <p id="statEvents" class="text-lg font-semibold text-white">0</p>
                     </div>
                     <div class="bg-slate-900/50 rounded-lg p-3">
@@ -124,6 +124,8 @@
     let eventSource = null;
     let currentJobId = sessionStorage.getItem('refresh_job_id') ? parseInt(sessionStorage.getItem('refresh_job_id')) : null;
     let lastLogLine = parseInt(sessionStorage.getItem('last_log_line') || '0');
+    let fetchedOpenCount = 0;
+    let fetchedClosedCount = 0;
 
     // Auto-unlock if password is stored
     if (password) {
@@ -216,6 +218,8 @@
                 const data = await resp.json();
                 currentJobId = data.job_id;
                 lastLogLine = 0;
+                fetchedOpenCount = 0;
+                fetchedClosedCount = 0;
                 sessionStorage.setItem('refresh_job_id', currentJobId);
                 sessionStorage.setItem('last_log_line', '0');
                 clearTerminal();
@@ -344,19 +348,73 @@
         'error': 'Error occurred',
     };
 
+    function parseFetchedCount(logLines) {
+        // Parse "Fetched XXXX events..." from log lines to track fetch progress
+        if (!logLines) return;
+        for (const log of logLines) {
+            const match = log.line.match(/Fetched (\d+) events/);
+            if (match) {
+                const count = parseInt(match[1]);
+                if (log.line.includes('[open]')) fetchedOpenCount = count;
+                else if (log.line.includes('[closed]')) fetchedClosedCount = count;
+            }
+        }
+    }
+
+    function calculateProgress(state) {
+        // Multi-phase progress: fetch_open 0-15%, fetch_closed 15-35%, upsert 35-90%, tags 90-99%, done 100%
+        if (state.phase === 'done') return 100;
+        if (state.phase === 'error' || state.phase === 'cancelled') return 100;
+        if (state.phase === 'fetching_open') {
+            // Estimate ~7000 open events typical
+            return Math.min(14, Math.round((fetchedOpenCount / 7000) * 15));
+        }
+        if (state.phase === 'fetching_closed') {
+            // Estimate ~30000 closed events typical
+            return 15 + Math.min(19, Math.round((fetchedClosedCount / 30000) * 20));
+        }
+        if (state.phase === 'upserting') {
+            if (state.total_events > 0) {
+                return 35 + Math.round((state.processed_events / state.total_events) * 55);
+            }
+            return 35;
+        }
+        if (state.phase === 'building_tags') return 92;
+        return 0;
+    }
+
     function updateUI(state) {
-        const pct = state.total_events > 0
-            ? Math.round((state.processed_events / state.total_events) * 100)
-            : (state.phase === 'done' ? 100 : 0);
+        // Parse fetch counts from log lines before calculating progress
+        parseFetchedCount(state.log_lines);
+        const pct = calculateProgress(state);
+        const bar = document.getElementById('progressBar');
+        const isFetching = state.phase === 'fetching_open' || state.phase === 'fetching_closed';
 
         document.getElementById('phaseLabel').textContent = phaseLabels[state.phase] || state.phase;
         document.getElementById('progressPct').textContent = pct + '%';
-        document.getElementById('progressBar').style.width = pct + '%';
+        bar.style.width = Math.max(pct, isFetching ? 2 : 0) + '%';
 
-        document.getElementById('statEvents').textContent = (state.processed_events || 0).toLocaleString();
-        document.getElementById('statMarkets').textContent = (state.new_markets || 0).toLocaleString();
-        document.getElementById('statSnapshots').textContent = (state.snapshots || 0).toLocaleString();
-        document.getElementById('statSkipped').textContent = (state.skipped_events || 0).toLocaleString();
+        // Toggle striped animation during fetch phases
+        if (isFetching) {
+            bar.classList.add('progress-striped');
+        } else {
+            bar.classList.remove('progress-striped');
+        }
+
+        // Stats: show fetched counts during fetch phases, counters during upsert
+        if (isFetching) {
+            document.getElementById('statEventsLabel').textContent = 'Events Fetched';
+            document.getElementById('statEvents').textContent = (fetchedOpenCount + fetchedClosedCount).toLocaleString();
+            document.getElementById('statMarkets').textContent = '-';
+            document.getElementById('statSnapshots').textContent = '-';
+            document.getElementById('statSkipped').textContent = '-';
+        } else {
+            document.getElementById('statEventsLabel').textContent = 'Events Processed';
+            document.getElementById('statEvents').textContent = (state.processed_events || 0).toLocaleString();
+            document.getElementById('statMarkets').textContent = (state.new_markets || 0).toLocaleString();
+            document.getElementById('statSnapshots').textContent = (state.snapshots || 0).toLocaleString();
+            document.getElementById('statSkipped').textContent = (state.skipped_events || 0).toLocaleString();
+        }
 
         // Append log lines to terminal
         if (state.log_lines && state.log_lines.length > 0) {
@@ -370,23 +428,23 @@
         }
 
         if (state.phase === 'done') {
-            document.getElementById('progressBar').classList.remove('bg-indigo-500');
-            document.getElementById('progressBar').classList.add('bg-emerald-500');
+            bar.classList.remove('bg-indigo-500');
+            bar.classList.add('bg-emerald-500');
             document.getElementById('refreshDone').textContent = `Refresh completed at ${state.finished_at}`;
             document.getElementById('refreshDone').classList.remove('hidden');
         } else if (state.phase === 'error') {
-            document.getElementById('progressBar').classList.remove('bg-indigo-500');
-            document.getElementById('progressBar').classList.add('bg-red-500');
+            bar.classList.remove('bg-indigo-500');
+            bar.classList.add('bg-red-500');
             document.getElementById('refreshError').textContent = `Error: ${state.error}`;
             document.getElementById('refreshError').classList.remove('hidden');
         } else if (state.phase === 'cancelled') {
-            document.getElementById('progressBar').classList.remove('bg-indigo-500');
-            document.getElementById('progressBar').classList.add('bg-yellow-500');
+            bar.classList.remove('bg-indigo-500');
+            bar.classList.add('bg-yellow-500');
             document.getElementById('refreshDone').textContent = 'Refresh was cancelled';
             document.getElementById('refreshDone').classList.remove('hidden');
         } else {
-            document.getElementById('progressBar').classList.add('bg-indigo-500');
-            document.getElementById('progressBar').classList.remove('bg-emerald-500', 'bg-red-500', 'bg-yellow-500');
+            bar.classList.add('bg-indigo-500');
+            bar.classList.remove('bg-emerald-500', 'bg-red-500', 'bg-yellow-500');
         }
     }
 </script>
