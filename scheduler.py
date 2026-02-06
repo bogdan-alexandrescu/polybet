@@ -67,7 +67,7 @@ def update_schedule(cron_expr):
             month=parts[3],
             day_of_week=parts[4],
         )
-        _scheduler.add_job(run_refresh, trigger, id=JOB_ID, replace_existing=True)
+        _scheduler.add_job(lambda: run_refresh(source='scheduler'), trigger, id=JOB_ID, replace_existing=True)
 
 
 def stop_scheduler():

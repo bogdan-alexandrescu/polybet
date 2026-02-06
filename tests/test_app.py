@@ -562,12 +562,18 @@ class TestSettingsApi:
 
 
 class TestRefreshApi:
-    def test_refresh_status(self, app_client):
+    def test_refresh_status_no_jobs(self, app_client):
         resp = app_client.get("/api/refresh/status")
         assert resp.status_code == 200
         data = resp.get_json()
-        assert "running" in data
-        assert "phase" in data
+        assert data["running"] is False
+        assert data["phase"] == ""
+
+    def test_refresh_status_with_job_id(self, app_client):
+        resp = app_client.get("/api/refresh/status?job_id=999")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["running"] is False
 
     def test_refresh_start_unauthorized(self, app_client):
         resp = app_client.post("/api/refresh/start")

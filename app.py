@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 
 from flask import Flask, Response, g, jsonify, render_template, request
 from functools import wraps
@@ -40,7 +41,7 @@ from analytics import (
     compute_histogram,
     compute_lorenz,
 )
-from refresh import get_state, request_cancel, run_refresh, sse_generator
+from refresh import get_job, get_logs, request_cancel, run_refresh, sse_generator
 
 SETTINGS_PASSWORD = os.environ.get("SETTINGS_PASSWORD", "admin")
 
@@ -342,28 +343,40 @@ def create_app():
     @app.route("/api/refresh/start", methods=["POST"])
     @require_auth
     def api_refresh_start():
-        state = get_state()
-        if state["running"]:
-            return jsonify({"error": "Refresh already running"}), 409
-        t = threading.Thread(target=run_refresh, daemon=True)
+        conn = get_db()
+        running = conn.execute(
+            "SELECT id FROM refresh_jobs WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if running:
+            return jsonify({"error": "Refresh already running", "job_id": running["id"]}), 409
+        t = threading.Thread(target=run_refresh, args=("web",), daemon=True)
         t.start()
-        return jsonify({"status": "started"})
+        time.sleep(0.3)
+        job = conn.execute("SELECT id FROM refresh_jobs ORDER BY id DESC LIMIT 1").fetchone()
+        return jsonify({"status": "started", "job_id": job["id"] if job else None})
 
     @app.route("/api/refresh/cancel", methods=["POST"])
     @require_auth
     def api_refresh_cancel():
-        if request_cancel():
-            return jsonify({"status": "cancel_requested"})
-        return jsonify({"error": "No refresh running"}), 409
+        job_id = request.get_json(silent=True) or {}
+        request_cancel(job_id.get("job_id"))
+        return jsonify({"status": "cancel_requested"})
 
     @app.route("/api/refresh/status")
     def api_refresh_status():
-        return jsonify(get_state())
+        job_id = request.args.get("job_id", type=int)
+        after_line = request.args.get("after_line", 0, type=int)
+        job = get_job(job_id)
+        if not job:
+            return jsonify({"running": False, "phase": ""})
+        job["log_lines"] = get_logs(job["id"], after_id=after_line)
+        return jsonify(job)
 
     @app.route("/api/refresh/stream")
     def api_refresh_stream():
+        job_id = request.args.get("job_id", type=int)
         return Response(
-            sse_generator(),
+            sse_generator(job_id),
             mimetype="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

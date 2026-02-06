@@ -1,9 +1,9 @@
-"""Refresh engine with progress state and SSE streaming."""
+"""Refresh engine with DB-backed progress state and SSE streaming."""
 
+import io
 import json
-import threading
+import sys
 import time
-from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
 from db import get_connection, return_connection, create_indexes, create_tag_table
@@ -11,162 +11,313 @@ from pull_markets import (
     fetch_all_events, init_db, upsert_event, upsert_market, insert_snapshot,
 )
 
-_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# DB-backed job state functions
+# ---------------------------------------------------------------------------
+
+def create_job(source="web"):
+    """Insert a new refresh_jobs row and return the job id."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "INSERT INTO refresh_jobs (status, source) VALUES ('running', %(source)s) RETURNING id",
+            {"source": source},
+        ).fetchone()
+        conn.commit()
+        return row["id"]
+    finally:
+        return_connection(conn)
 
 
-@dataclass
-class RefreshState:
-    running: bool = False
-    phase: str = ""
-    total_events: int = 0
-    processed_events: int = 0
-    new_events: int = 0
-    updated_events: int = 0
-    skipped_events: int = 0
-    new_markets: int = 0
-    updated_markets: int = 0
-    snapshots: int = 0
-    error: str | None = None
-    cancel_requested: bool = False
-    started_at: str | None = None
-    finished_at: str | None = None
+def update_job(conn, job_id, **kwargs):
+    """Update columns on a refresh_jobs row (immediate commit)."""
+    if not kwargs:
+        return
+    parts = []
+    params = {"job_id": job_id}
+    for key, value in kwargs.items():
+        parts.append(f"{key} = %({key})s")
+        params[key] = value
+    conn.execute(
+        f"UPDATE refresh_jobs SET {', '.join(parts)} WHERE id = %(job_id)s",
+        params,
+    )
+    conn.commit()
 
 
-_state = RefreshState()
+def get_job(job_id=None):
+    """Return the latest (or specific) refresh job as a dict, or None."""
+    conn = get_connection()
+    try:
+        if job_id:
+            row = conn.execute(
+                "SELECT * FROM refresh_jobs WHERE id = %(id)s",
+                {"id": job_id},
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM refresh_jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["running"] = result["status"] == "running"
+        # Convert timestamps to ISO strings for JSON
+        for ts_field in ("started_at", "finished_at"):
+            if result[ts_field] is not None:
+                result[ts_field] = result[ts_field].isoformat()
+        return result
+    finally:
+        return_connection(conn)
 
 
-def get_state() -> dict:
-    """Return current refresh state as a dict (thread-safe snapshot)."""
-    with _lock:
-        return asdict(_state)
+def request_cancel(job_id=None):
+    """Request cancellation of a running job."""
+    conn = get_connection()
+    try:
+        if job_id:
+            conn.execute(
+                "UPDATE refresh_jobs SET cancel_requested = TRUE WHERE id = %(id)s AND status = 'running'",
+                {"id": job_id},
+            )
+        else:
+            conn.execute(
+                "UPDATE refresh_jobs SET cancel_requested = TRUE WHERE status = 'running'"
+            )
+        conn.commit()
+        return True
+    finally:
+        return_connection(conn)
 
 
-def request_cancel():
-    """Request cancellation of the running refresh."""
-    with _lock:
-        if _state.running:
-            _state.cancel_requested = True
-            return True
+def is_cancelled(conn, job_id):
+    """Fast check: is cancellation requested for this job?"""
+    row = conn.execute(
+        "SELECT cancel_requested FROM refresh_jobs WHERE id = %(id)s",
+        {"id": job_id},
+    ).fetchone()
+    return row and row["cancel_requested"]
+
+
+def append_log(conn, job_id, line):
+    """Insert a log line for the given job (immediate commit)."""
+    conn.execute(
+        "INSERT INTO refresh_logs (job_id, line) VALUES (%(job_id)s, %(line)s)",
+        {"job_id": job_id, "line": line},
+    )
+    conn.commit()
+
+
+def get_logs(job_id, after_id=0):
+    """Return log lines for a job after the given id."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, line FROM refresh_logs WHERE job_id = %(job_id)s AND id > %(after_id)s ORDER BY id",
+            {"job_id": job_id, "after_id": after_id},
+        ).fetchall()
+        return [{"id": r["id"], "line": r["line"]} for r in rows]
+    finally:
+        return_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# LogCapture — tees stdout to both console and DB
+# ---------------------------------------------------------------------------
+
+class LogCapture(io.TextIOBase):
+    """Wraps stdout to tee output to both console and refresh_logs table."""
+
+    def __init__(self, original, conn, job_id):
+        self._original = original
+        self._conn = conn
+        self._job_id = job_id
+        self._buffer = ""
+
+    def write(self, text):
+        if self._original:
+            self._original.write(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                try:
+                    append_log(self._conn, self._job_id, line)
+                except Exception:
+                    pass
+        return len(text)
+
+    def flush(self):
+        if self._original:
+            self._original.flush()
+        # Flush remaining buffer
+        if self._buffer.strip():
+            try:
+                append_log(self._conn, self._job_id, self._buffer)
+            except Exception:
+                pass
+            self._buffer = ""
+
+    def isatty(self):
         return False
 
 
-def _update(**kwargs):
-    """Update state fields under the lock."""
-    with _lock:
-        for k, v in kwargs.items():
-            setattr(_state, k, v)
+# ---------------------------------------------------------------------------
+# Main refresh function
+# ---------------------------------------------------------------------------
 
+def run_refresh(source="web"):
+    """Execute a full data refresh with DB-backed progress tracking."""
+    job_id = create_job(source)
+    data_conn = None
+    state_conn = None
+    original_stdout = sys.stdout
 
-def run_refresh():
-    """Execute a full data refresh with progress tracking."""
-    with _lock:
-        if _state.running:
-            return
-        # Reset state
-        _state.__init__()
-        _state.running = True
-        _state.started_at = datetime.now(timezone.utc).isoformat()
-
-    conn = None
     try:
-        conn = get_connection()
-        init_db(conn)
+        data_conn = get_connection()
+        state_conn = get_connection()
+
+        # Install log capture
+        sys.stdout = LogCapture(original_stdout, state_conn, job_id)
+
+        init_db(data_conn)
 
         # Phase 1: Fetch open events
-        _update(phase="fetching_open")
+        update_job(state_conn, job_id, phase="fetching_open")
+        print("Fetching open events from Polymarket API...")
         open_events = fetch_all_events(closed=False, label="[open] ")
 
-        with _lock:
-            if _state.cancel_requested:
-                _state.phase = "cancelled"
-                _state.running = False
-                _state.finished_at = datetime.now(timezone.utc).isoformat()
-                return
+        if is_cancelled(state_conn, job_id):
+            update_job(state_conn, job_id, status="cancelled", phase="cancelled",
+                       finished_at=datetime.now(timezone.utc))
+            print("Refresh cancelled.")
+            return
 
         # Phase 2: Fetch closed events
-        _update(phase="fetching_closed")
+        update_job(state_conn, job_id, phase="fetching_closed")
+        print("Fetching closed events from Polymarket API...")
 
-        # Build known closed IDs to skip
         known_closed_ids = set()
-        rows = conn.execute("SELECT id FROM events WHERE closed = 1").fetchall()
+        rows = data_conn.execute("SELECT id FROM events WHERE closed = 1").fetchall()
         known_closed_ids = {r["id"] for r in rows}
 
         closed_events = fetch_all_events(closed=True, label="[closed] ")
 
-        with _lock:
-            if _state.cancel_requested:
-                _state.phase = "cancelled"
-                _state.running = False
-                _state.finished_at = datetime.now(timezone.utc).isoformat()
-                return
+        if is_cancelled(state_conn, job_id):
+            update_job(state_conn, job_id, status="cancelled", phase="cancelled",
+                       finished_at=datetime.now(timezone.utc))
+            print("Refresh cancelled.")
+            return
 
         all_events = open_events + closed_events
-        _update(total_events=len(all_events), phase="upserting")
+        total = len(all_events)
+        update_job(state_conn, job_id, total_events=total, phase="upserting")
+        print(f"Processing {total} events...")
 
         now = datetime.now(timezone.utc).isoformat()
 
-        # Phase 3: Upsert events + markets
-        for event in all_events:
-            with _lock:
-                if _state.cancel_requested:
-                    _state.phase = "cancelled"
-                    _state.running = False
-                    _state.finished_at = datetime.now(timezone.utc).isoformat()
-                    return
+        # Phase 3: Upsert events + markets (batched counter updates)
+        counters = {
+            "processed_events": 0,
+            "new_events": 0,
+            "updated_events": 0,
+            "skipped_events": 0,
+            "new_markets": 0,
+            "updated_markets": 0,
+            "snapshots": 0,
+        }
+        flush_interval = 50
+
+        for i, event in enumerate(all_events):
+            if is_cancelled(state_conn, job_id):
+                update_job(state_conn, job_id, status="cancelled", phase="cancelled",
+                           finished_at=datetime.now(timezone.utc), **counters)
+                print("Refresh cancelled.")
+                return
 
             is_closed = event.get("closed", False)
 
-            # Skip closed events we already have
             if is_closed and event.get("id") in known_closed_ids:
-                _update(
-                    skipped_events=_state.skipped_events + 1,
-                    processed_events=_state.processed_events + 1,
-                )
+                counters["skipped_events"] += 1
+                counters["processed_events"] += 1
+                if (i + 1) % flush_interval == 0:
+                    update_job(state_conn, job_id, **counters)
                 continue
 
-            upsert_event(conn, event, now)
-            _update(new_events=_state.new_events + 1)
+            upsert_event(data_conn, event, now)
+            counters["new_events"] += 1
 
             for market in event.get("markets", []):
-                upsert_market(conn, market, event["id"], now)
-                _update(new_markets=_state.new_markets + 1)
+                upsert_market(data_conn, market, event["id"], now)
+                counters["new_markets"] += 1
 
                 if not is_closed:
-                    insert_snapshot(conn, market, now)
-                    _update(snapshots=_state.snapshots + 1)
+                    insert_snapshot(data_conn, market, now)
+                    counters["snapshots"] += 1
 
-            _update(processed_events=_state.processed_events + 1)
+            counters["processed_events"] += 1
 
-        conn.commit()
+            if (i + 1) % flush_interval == 0:
+                update_job(state_conn, job_id, **counters)
+                print(f"  Processed {counters['processed_events']}/{total} events...")
+
+        # Final counter flush
+        update_job(state_conn, job_id, **counters)
+
+        data_conn.commit()
+        print(f"Committed {counters['new_events']} events, {counters['new_markets']} markets, {counters['snapshots']} snapshots.")
 
         # Phase 4: Rebuild tag table
-        _update(phase="building_tags")
-        create_indexes(conn)
-        create_tag_table(conn)
+        update_job(state_conn, job_id, phase="building_tags")
+        print("Rebuilding indexes and tag table...")
+        create_indexes(data_conn)
+        create_tag_table(data_conn)
 
-        _update(
-            phase="done",
-            running=False,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-        )
+        update_job(state_conn, job_id,
+                   status="done", phase="done",
+                   finished_at=datetime.now(timezone.utc),
+                   **counters)
+        print("Refresh complete!")
 
     except Exception as e:
-        _update(
-            phase="error",
-            error=str(e),
-            running=False,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-        )
+        try:
+            update_job(state_conn or get_connection(), job_id,
+                       status="error", phase="error",
+                       error=str(e),
+                       finished_at=datetime.now(timezone.utc))
+        except Exception:
+            pass
+        print(f"Refresh error: {e}")
     finally:
-        if conn is not None:
-            return_connection(conn)
+        sys.stdout = original_stdout
+        if data_conn is not None:
+            return_connection(data_conn)
+        if state_conn is not None:
+            return_connection(state_conn)
 
 
-def sse_generator():
-    """Yield SSE events with refresh state every 0.5s."""
+# ---------------------------------------------------------------------------
+# SSE generator
+# ---------------------------------------------------------------------------
+
+def sse_generator(job_id=None):
+    """Yield SSE events with refresh state + log lines every 0.5s."""
+    last_log_id = 0
+
     while True:
-        state = get_state()
-        yield f"data: {json.dumps(state)}\n\n"
-        if not state["running"] and state["phase"] in ("done", "cancelled", "error", ""):
+        job = get_job(job_id)
+        if not job:
+            yield f"data: {json.dumps({'running': False, 'phase': ''})}\n\n"
+            break
+
+        logs = get_logs(job["id"], after_id=last_log_id)
+        if logs:
+            last_log_id = logs[-1]["id"]
+        job["log_lines"] = logs
+
+        yield f"data: {json.dumps(job, default=str)}\n\n"
+
+        if not job["running"] and job["phase"] in ("done", "cancelled", "error", ""):
             break
         time.sleep(0.5)

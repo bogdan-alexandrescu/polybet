@@ -100,6 +100,15 @@
                     </div>
                 </div>
 
+                <!-- Terminal Output -->
+                <div class="mt-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <h3 class="text-sm font-medium text-slate-400">Live Output</h3>
+                        <button onclick="clearTerminal()" class="text-xs text-slate-500 hover:text-slate-300">Clear</button>
+                    </div>
+                    <pre id="terminal" class="bg-slate-950 border border-slate-700 rounded-lg p-4 h-64 overflow-y-auto font-mono text-xs text-green-400 whitespace-pre-wrap"></pre>
+                </div>
+
                 <p id="refreshError" class="hidden text-sm text-red-400 mt-2"></p>
                 <p id="refreshDone" class="hidden text-sm text-emerald-400 mt-2"></p>
             </div>
@@ -113,6 +122,8 @@
 <script>
     let password = sessionStorage.getItem('settings_password') || '';
     let eventSource = null;
+    let currentJobId = sessionStorage.getItem('refresh_job_id') ? parseInt(sessionStorage.getItem('refresh_job_id')) : null;
+    let lastLogLine = parseInt(sessionStorage.getItem('last_log_line') || '0');
 
     // Auto-unlock if password is stored
     if (password) {
@@ -191,6 +202,10 @@
         }
     }
 
+    function clearTerminal() {
+        document.getElementById('terminal').textContent = '';
+    }
+
     async function startRefresh() {
         try {
             const resp = await fetch('/api/refresh/start', {
@@ -198,11 +213,25 @@
                 headers: getHeaders(),
             });
             if (resp.ok) {
+                const data = await resp.json();
+                currentJobId = data.job_id;
+                lastLogLine = 0;
+                sessionStorage.setItem('refresh_job_id', currentJobId);
+                sessionStorage.setItem('last_log_line', '0');
+                clearTerminal();
                 showProgress();
-                connectSSE();
+                connectSSE(currentJobId);
             } else {
                 const data = await resp.json();
-                alert(data.error || 'Failed to start refresh');
+                if (data.job_id) {
+                    // Already running, resume tracking
+                    currentJobId = data.job_id;
+                    sessionStorage.setItem('refresh_job_id', currentJobId);
+                    showProgress();
+                    connectSSE(currentJobId);
+                } else {
+                    alert(data.error || 'Failed to start refresh');
+                }
             }
         } catch (e) {
             alert('Connection error');
@@ -214,18 +243,32 @@
             await fetch('/api/refresh/cancel', {
                 method: 'POST',
                 headers: getHeaders(),
+                body: JSON.stringify({ job_id: currentJobId }),
             });
         } catch (e) { /* ignore */ }
     }
 
     async function checkRefreshStatus() {
         try {
-            const resp = await fetch('/api/refresh/status');
+            // Check for stored job_id from previous session
+            let url = '/api/refresh/status';
+            if (currentJobId) {
+                url += '?job_id=' + currentJobId + '&after_line=' + lastLogLine;
+            }
+            const resp = await fetch(url);
             if (resp.ok) {
                 const state = await resp.json();
                 if (state.running) {
+                    currentJobId = state.id || currentJobId;
+                    sessionStorage.setItem('refresh_job_id', currentJobId);
                     showProgress();
-                    connectSSE();
+                    updateUI(state);
+                    connectSSE(currentJobId);
+                } else if (state.phase && state.phase !== '') {
+                    // Show completed/cancelled/error state
+                    showProgress();
+                    updateUI(state);
+                    hideProgress();
                 }
             }
         } catch (e) { /* ignore */ }
@@ -244,9 +287,11 @@
         document.getElementById('cancelBtn').classList.add('hidden');
     }
 
-    function connectSSE() {
+    function connectSSE(jobId) {
         if (eventSource) eventSource.close();
-        eventSource = new EventSource('/api/refresh/stream');
+        let url = '/api/refresh/stream';
+        if (jobId) url += '?job_id=' + jobId;
+        eventSource = new EventSource(url);
         eventSource.onmessage = (e) => {
             const state = JSON.parse(e.data);
             updateUI(state);
@@ -254,6 +299,8 @@
                 eventSource.close();
                 eventSource = null;
                 hideProgress();
+                sessionStorage.removeItem('refresh_job_id');
+                sessionStorage.removeItem('last_log_line');
             }
         };
         eventSource.onerror = () => {
@@ -266,7 +313,11 @@
 
     async function pollStatus() {
         try {
-            const resp = await fetch('/api/refresh/status');
+            let url = '/api/refresh/status';
+            if (currentJobId) {
+                url += '?job_id=' + currentJobId + '&after_line=' + lastLogLine;
+            }
+            const resp = await fetch(url);
             if (resp.ok) {
                 const state = await resp.json();
                 updateUI(state);
@@ -274,6 +325,8 @@
                     setTimeout(pollStatus, 1000);
                 } else {
                     hideProgress();
+                    sessionStorage.removeItem('refresh_job_id');
+                    sessionStorage.removeItem('last_log_line');
                 }
             }
         } catch (e) {
@@ -300,10 +353,21 @@
         document.getElementById('progressPct').textContent = pct + '%';
         document.getElementById('progressBar').style.width = pct + '%';
 
-        document.getElementById('statEvents').textContent = state.processed_events.toLocaleString();
-        document.getElementById('statMarkets').textContent = state.new_markets.toLocaleString();
-        document.getElementById('statSnapshots').textContent = state.snapshots.toLocaleString();
-        document.getElementById('statSkipped').textContent = state.skipped_events.toLocaleString();
+        document.getElementById('statEvents').textContent = (state.processed_events || 0).toLocaleString();
+        document.getElementById('statMarkets').textContent = (state.new_markets || 0).toLocaleString();
+        document.getElementById('statSnapshots').textContent = (state.snapshots || 0).toLocaleString();
+        document.getElementById('statSkipped').textContent = (state.skipped_events || 0).toLocaleString();
+
+        // Append log lines to terminal
+        if (state.log_lines && state.log_lines.length > 0) {
+            const terminal = document.getElementById('terminal');
+            for (const log of state.log_lines) {
+                terminal.textContent += log.line + '\n';
+                lastLogLine = log.id;
+            }
+            sessionStorage.setItem('last_log_line', String(lastLogLine));
+            terminal.scrollTop = terminal.scrollHeight;
+        }
 
         if (state.phase === 'done') {
             document.getElementById('progressBar').classList.remove('bg-indigo-500');

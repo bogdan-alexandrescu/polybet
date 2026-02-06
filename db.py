@@ -98,6 +98,38 @@ def init_analytics_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_jobs (
+                id SERIAL PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'running',
+                source TEXT NOT NULL DEFAULT 'web',
+                phase TEXT NOT NULL DEFAULT '',
+                total_events INT DEFAULT 0,
+                processed_events INT DEFAULT 0,
+                new_events INT DEFAULT 0,
+                updated_events INT DEFAULT 0,
+                skipped_events INT DEFAULT 0,
+                new_markets INT DEFAULT 0,
+                updated_markets INT DEFAULT 0,
+                snapshots INT DEFAULT 0,
+                error TEXT,
+                cancel_requested BOOLEAN DEFAULT FALSE,
+                started_at TIMESTAMP DEFAULT NOW(),
+                finished_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_logs (
+                id SERIAL PRIMARY KEY,
+                job_id INT NOT NULL REFERENCES refresh_jobs(id),
+                line TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_refresh_logs_job
+            ON refresh_logs(job_id, id)
+        """)
         conn.commit()
 
         # Check if core tables exist before creating indexes/tags
