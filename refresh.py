@@ -16,6 +16,23 @@ from pull_markets import (
 # DB-backed job state functions
 # ---------------------------------------------------------------------------
 
+def cleanup_orphaned_jobs():
+    """Mark any 'running' jobs as 'error' on startup (they were orphaned by a restart)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE refresh_jobs
+               SET status = 'error', phase = 'error',
+                   error = 'Interrupted by server restart', finished_at = NOW()
+               WHERE status = 'running'"""
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        return_connection(conn)
+
+
 def create_job(source="web"):
     """Insert a new refresh_jobs row and return the job id."""
     conn = get_connection()
@@ -73,17 +90,23 @@ def get_job(job_id=None):
 
 
 def request_cancel(job_id=None):
-    """Request cancellation of a running job."""
+    """Cancel a running job: set flag for the thread AND force status for orphaned jobs."""
     conn = get_connection()
     try:
         if job_id:
             conn.execute(
-                "UPDATE refresh_jobs SET cancel_requested = TRUE WHERE id = %(id)s AND status = 'running'",
+                """UPDATE refresh_jobs
+                   SET cancel_requested = TRUE, status = 'cancelled',
+                       phase = 'cancelled', finished_at = NOW()
+                   WHERE id = %(id)s AND status = 'running'""",
                 {"id": job_id},
             )
         else:
             conn.execute(
-                "UPDATE refresh_jobs SET cancel_requested = TRUE WHERE status = 'running'"
+                """UPDATE refresh_jobs
+                   SET cancel_requested = TRUE, status = 'cancelled',
+                       phase = 'cancelled', finished_at = NOW()
+                   WHERE status = 'running'"""
             )
         conn.commit()
         return True

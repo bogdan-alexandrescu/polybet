@@ -41,7 +41,7 @@ from analytics import (
     compute_histogram,
     compute_lorenz,
 )
-from refresh import get_job, get_logs, request_cancel, run_refresh, sse_generator
+from refresh import cleanup_orphaned_jobs, get_job, get_logs, request_cancel, run_refresh, sse_generator
 
 SETTINGS_PASSWORD = os.environ.get("SETTINGS_PASSWORD", "admin")
 
@@ -104,6 +104,7 @@ def create_app():
     with app.app_context():
         try:
             init_analytics_db()
+            cleanup_orphaned_jobs()
         except Exception as e:
             print(f"Warning: DB init failed on startup: {e}")
             print("App will start anyway — tables will be created on first refresh.")
