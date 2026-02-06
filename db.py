@@ -1,30 +1,48 @@
-"""Database connection and initialization for Polybet analytics."""
+"""Database connection pool and initialization for Polybet analytics (PostgreSQL)."""
 
-import sqlite3
+import os
 import time
-from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "polybet.db"
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://localhost:5432/polybet"
+)
+
+_pool = None
+
+
+def get_pool():
+    """Return the global connection pool, creating it on first call."""
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=2,
+            max_size=10,
+            kwargs={"row_factory": dict_row},
+        )
+    return _pool
 
 
 def get_connection():
-    """Get a read-only SQLite connection with optimized settings."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA cache_size=-65536")  # 64MB cache
-    conn.execute("PRAGMA mmap_size=1073741824")  # 1GB mmap
-    conn.execute("PRAGMA query_only=ON")
-    return conn
+    """Borrow a connection from the pool."""
+    return get_pool().getconn()
 
 
-def get_rw_connection():
-    """Get a read-write connection for initialization tasks."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def return_connection(conn):
+    """Return a connection to the pool."""
+    get_pool().putconn(conn)
+
+
+def close_pool():
+    """Close the connection pool (for graceful shutdown)."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
 
 
 def create_indexes(conn):
@@ -53,9 +71,10 @@ def create_tag_table(conn):
     conn.execute("""
         INSERT INTO event_tags (event_id, tag_label, tag_slug)
         SELECT e.id,
-               json_extract(t.value, '$.label'),
-               json_extract(t.value, '$.slug')
-        FROM events e, json_each(e.tags) t
+               t.value->>'label',
+               t.value->>'slug'
+        FROM events e,
+             jsonb_array_elements(e.tags::jsonb) AS t(value)
         WHERE e.tags IS NOT NULL AND e.tags != '[]'
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_event_tags_slug ON event_tags(tag_slug)")
@@ -64,9 +83,19 @@ def create_tag_table(conn):
 
 
 def init_analytics_db():
-    """Run all startup initialization (indexes + tag table)."""
-    conn = get_rw_connection()
+    """Run all startup initialization (indexes + tag table + settings table)."""
+    conn = get_connection()
     try:
+        # Create settings table if not exists
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+
         print("Creating analytics indexes...")
         t0 = time.time()
         create_indexes(conn)
@@ -75,7 +104,7 @@ def init_analytics_db():
         print("Building materialized tag table...")
         t0 = time.time()
         create_tag_table(conn)
-        count = conn.execute("SELECT COUNT(*) FROM event_tags").fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) AS cnt FROM event_tags").fetchone()["cnt"]
         print(f"  Tag table populated with {count:,} rows in {time.time() - t0:.1f}s")
     finally:
-        conn.close()
+        return_connection(conn)

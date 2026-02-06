@@ -1,22 +1,30 @@
-"""Shared fixtures for Polybet test suite."""
+"""Shared fixtures for Polybet test suite (PostgreSQL)."""
 
 import json
-import sqlite3
-import tempfile
-from pathlib import Path
+import os
 from unittest.mock import patch
 
+import psycopg
+from psycopg.rows import dict_row
 import pytest
 
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql://localhost:5432/polybet_test"
+)
 
-def create_test_db(db_path):
-    """Create a test database with realistic sample data."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
 
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS events (
+def create_test_db(conn):
+    """Create test tables and populate with realistic sample data."""
+    # Drop existing tables in reverse dependency order
+    conn.execute("DROP TABLE IF EXISTS price_snapshots CASCADE")
+    conn.execute("DROP TABLE IF EXISTS markets CASCADE")
+    conn.execute("DROP TABLE IF EXISTS event_tags CASCADE")
+    conn.execute("DROP TABLE IF EXISTS events CASCADE")
+    conn.execute("DROP TABLE IF EXISTS settings CASCADE")
+    conn.commit()
+
+    conn.execute("""
+        CREATE TABLE events (
             id TEXT PRIMARY KEY, ticker TEXT, slug TEXT, title TEXT,
             description TEXT, start_date TEXT, end_date TEXT,
             active INTEGER, closed INTEGER, neg_risk INTEGER,
@@ -25,9 +33,11 @@ def create_test_db(db_path):
             open_interest INTEGER, comment_count INTEGER,
             tags TEXT, created_at TEXT, updated_at TEXT,
             first_seen TEXT NOT NULL, last_synced TEXT NOT NULL
-        );
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS markets (
+    conn.execute("""
+        CREATE TABLE markets (
             id TEXT PRIMARY KEY, event_id TEXT REFERENCES events(id),
             question TEXT, slug TEXT, condition_id TEXT,
             description TEXT, group_item_title TEXT,
@@ -41,21 +51,34 @@ def create_test_db(db_path):
             clob_token_ids TEXT, accepting_orders INTEGER,
             created_at TEXT, updated_at TEXT,
             first_seen TEXT NOT NULL, last_synced TEXT NOT NULL
-        );
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS price_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conn.execute("""
+        CREATE TABLE price_snapshots (
+            id SERIAL PRIMARY KEY,
             market_id TEXT NOT NULL REFERENCES markets(id),
             outcome_prices TEXT, volume REAL, liquidity REAL,
             spread REAL, best_ask REAL, last_trade_price REAL,
             fetched_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_snapshots_market
-            ON price_snapshots(market_id, fetched_at);
-        CREATE INDEX IF NOT EXISTS idx_markets_event
-            ON markets(event_id);
+        )
     """)
+
+    conn.execute("""
+        CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    conn.execute("""
+        CREATE INDEX idx_snapshots_market ON price_snapshots(market_id, fetched_at)
+    """)
+    conn.execute("""
+        CREATE INDEX idx_markets_event ON markets(event_id)
+    """)
+    conn.commit()
 
     # Insert sample events
     events = [
@@ -93,7 +116,9 @@ def create_test_db(db_path):
     ]
 
     for e in events:
-        conn.execute("""INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", e)
+        conn.execute("""
+            INSERT INTO events VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, e)
 
     # Insert sample markets
     markets = [
@@ -170,7 +195,9 @@ def create_test_db(db_path):
     ]
 
     for m in markets:
-        conn.execute("""INSERT INTO markets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", m)
+        conn.execute("""
+            INSERT INTO markets VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, m)
 
     # Insert price snapshots
     snapshots = [
@@ -185,12 +212,12 @@ def create_test_db(db_path):
     ]
 
     for s in snapshots:
-        conn.execute(
-            "INSERT INTO price_snapshots (market_id, outcome_prices, volume, liquidity, spread, best_ask, last_trade_price, fetched_at) VALUES (?,?,?,?,?,?,?,?)",
-            s
-        )
+        conn.execute("""
+            INSERT INTO price_snapshots (market_id, outcome_prices, volume, liquidity, spread, best_ask, last_trade_price, fetched_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, s)
 
-    # Create event_tags table
+    # Create event_tags table using PG JSON functions
     conn.execute("DROP TABLE IF EXISTS event_tags")
     conn.execute("""
         CREATE TABLE event_tags (
@@ -202,49 +229,63 @@ def create_test_db(db_path):
     conn.execute("""
         INSERT INTO event_tags (event_id, tag_label, tag_slug)
         SELECT e.id,
-               json_extract(t.value, '$.label'),
-               json_extract(t.value, '$.slug')
-        FROM events e, json_each(e.tags) t
+               t.value->>'label',
+               t.value->>'slug'
+        FROM events e,
+             jsonb_array_elements(e.tags::jsonb) AS t(value)
         WHERE e.tags IS NOT NULL AND e.tags != '[]'
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_tags_slug ON event_tags(tag_slug)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_tags_event ON event_tags(event_id)")
+    conn.execute("CREATE INDEX idx_event_tags_slug ON event_tags(tag_slug)")
+    conn.execute("CREATE INDEX idx_event_tags_event ON event_tags(event_id)")
 
     conn.commit()
-    return conn
 
 
-@pytest.fixture
-def test_db_path(tmp_path):
-    """Provide a path to a temporary test database."""
-    db_path = tmp_path / "test_polybet.db"
-    conn = create_test_db(db_path)
+@pytest.fixture(scope="session")
+def _test_db():
+    """Create the test database once per test session."""
+    conn = psycopg.connect(TEST_DATABASE_URL, row_factory=dict_row, autocommit=False)
+    create_test_db(conn)
     conn.close()
-    return db_path
 
 
 @pytest.fixture
-def test_conn(test_db_path):
-    """Provide a connection to the test database."""
-    conn = sqlite3.connect(str(test_db_path))
-    conn.row_factory = sqlite3.Row
+def test_conn(_test_db):
+    """Provide a connection to the test database per test."""
+    conn = psycopg.connect(TEST_DATABASE_URL, row_factory=dict_row, autocommit=False)
     yield conn
+    conn.rollback()
     conn.close()
 
 
 @pytest.fixture
-def app_client(test_db_path):
+def test_db_path(_test_db):
+    """Compatibility fixture — returns the DATABASE_URL for PG."""
+    return TEST_DATABASE_URL
+
+
+@pytest.fixture
+def app_client(_test_db):
     """Provide a Flask test client with mocked database."""
     import db as db_module
 
     def mock_get_connection():
-        conn = sqlite3.connect(str(test_db_path))
-        conn.row_factory = sqlite3.Row
-        return conn
+        return psycopg.connect(TEST_DATABASE_URL, row_factory=dict_row)
 
-    with patch.object(db_module, 'get_connection', mock_get_connection):
-        with patch('app.get_connection', mock_get_connection):
-            from app import app
-            app.config['TESTING'] = True
-            with app.test_client() as client:
-                yield client
+    def mock_return_connection(conn):
+        conn.close()
+
+    def mock_init():
+        pass
+
+    with patch.object(db_module, 'get_connection', mock_get_connection), \
+         patch.object(db_module, 'return_connection', mock_return_connection), \
+         patch.object(db_module, 'init_analytics_db', mock_init), \
+         patch('app.get_connection', mock_get_connection), \
+         patch('app.return_connection', mock_return_connection), \
+         patch('app.init_analytics_db', mock_init):
+        from app import create_app
+        test_app = create_app()
+        test_app.config['TESTING'] = True
+        with test_app.test_client() as client:
+            yield client

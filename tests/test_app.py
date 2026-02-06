@@ -1,40 +1,43 @@
 """Tests for app.py - Flask routes and API endpoints."""
 
 import json
+import os
 import pytest
 
 
 class TestParseTagsFilter:
-    def test_parse_valid_json(self):
+    """Tests for parse_tags filter — uses app_client to ensure mocked DB import."""
+
+    def test_parse_valid_json(self, app_client):
         from app import parse_tags
         tags_json = json.dumps([{"label": "Politics"}, {"label": "Elections"}])
         result = parse_tags(tags_json)
         assert result == ["Politics", "Elections"]
 
-    def test_parse_none(self):
+    def test_parse_none(self, app_client):
         from app import parse_tags
         assert parse_tags(None) == []
 
-    def test_parse_empty_string(self):
+    def test_parse_empty_string(self, app_client):
         from app import parse_tags
         assert parse_tags("") == []
 
-    def test_parse_invalid_json(self):
+    def test_parse_invalid_json(self, app_client):
         from app import parse_tags
         assert parse_tags("not json") == []
 
-    def test_parse_list_input(self):
+    def test_parse_list_input(self, app_client):
         from app import parse_tags
         result = parse_tags([{"label": "Test"}])
         assert result == ["Test"]
 
-    def test_parse_missing_label(self):
+    def test_parse_missing_label(self, app_client):
         from app import parse_tags
         result = parse_tags(json.dumps([{"id": "1"}, {"label": "Test"}]))
         assert "" in result
         assert "Test" in result
 
-    def test_parse_non_dict_items(self):
+    def test_parse_non_dict_items(self, app_client):
         from app import parse_tags
         result = parse_tags(json.dumps(["string1", "string2"]))
         assert result == []
@@ -88,6 +91,11 @@ class TestPageRoutes:
     def test_event_detail_not_found(self, app_client):
         resp = app_client.get("/event/nonexistent")
         assert resp.status_code == 404
+
+    def test_settings_page(self, app_client):
+        resp = app_client.get("/settings")
+        assert resp.status_code == 200
+        assert b"Settings" in resp.data
 
 
 class TestApiStats:
@@ -175,7 +183,6 @@ class TestApiMarkets:
             assert 0.30 <= m["last_trade_price"] <= 0.50
 
     def test_markets_invalid_page(self, app_client):
-        """Should handle non-integer page gracefully, defaulting to 1."""
         resp = app_client.get("/api/markets?page=abc")
         assert resp.status_code == 200
         data = resp.get_json()
@@ -320,9 +327,7 @@ class TestApiCalibration:
         assert "by_volume_tier" in data
 
     def test_calibration_returns_data_with_snapshots(self, app_client):
-        """Test data has pre-resolution snapshots for mkt_4 and mkt_5."""
         data = app_client.get("/api/calibration").get_json()
-        # mkt_4 (resolved YES, snapshot at 0.70) and mkt_5 (resolved NO, snapshot at 0.30)
         assert data["count"] == 2
 
     def test_calibration_brier_score(self, app_client):
@@ -340,7 +345,6 @@ class TestApiCalibration:
         assert resp.status_code == 200
 
     def test_calibration_empty_with_impossible_filter(self, app_client):
-        """Very high volume min should return no data gracefully."""
         data = app_client.get("/api/calibration?volume_min=999999999").get_json()
         assert data["count"] == 0
         assert data["brier_score"] is None
@@ -533,3 +537,42 @@ class TestFloatHelper:
     def test_integer_string(self):
         from app import _float
         assert _float("42") == 42.0
+
+
+class TestSettingsApi:
+    def test_get_settings_unauthorized(self, app_client):
+        resp = app_client.get("/api/settings")
+        assert resp.status_code == 401
+
+    def test_get_settings_authorized(self, app_client):
+        resp = app_client.get("/api/settings", headers={"X-Settings-Password": "admin"})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert isinstance(data, dict)
+
+    def test_update_settings(self, app_client):
+        resp = app_client.post(
+            "/api/settings",
+            headers={"X-Settings-Password": "admin", "Content-Type": "application/json"},
+            data=json.dumps({"cron_schedule": "0 */6 * * *"}),
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["status"] == "ok"
+
+
+class TestRefreshApi:
+    def test_refresh_status(self, app_client):
+        resp = app_client.get("/api/refresh/status")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "running" in data
+        assert "phase" in data
+
+    def test_refresh_start_unauthorized(self, app_client):
+        resp = app_client.post("/api/refresh/start")
+        assert resp.status_code == 401
+
+    def test_refresh_cancel_unauthorized(self, app_client):
+        resp = app_client.post("/api/refresh/cancel")
+        assert resp.status_code == 401

@@ -19,9 +19,9 @@ def get_stats(conn):
 
 def get_growth(conn, granularity="month"):
     """Events created per month + cumulative volume."""
-    fmt = "%Y-%m" if granularity == "month" else "%Y-%W"
+    fmt = "YYYY-MM" if granularity == "month" else "IYYY-IW"
     rows = conn.execute(f"""
-        SELECT strftime('{fmt}', created_at) AS period,
+        SELECT to_char(created_at::timestamp, '{fmt}') AS period,
                COUNT(*) AS event_count,
                COALESCE(SUM(volume), 0) AS period_volume
         FROM events
@@ -58,63 +58,63 @@ def get_markets(conn, status=None, tag=None, q=None, sort="volume",
         conditions.append("m.closed = 1")
 
     if tag:
-        conditions.append("EXISTS (SELECT 1 FROM event_tags et WHERE et.event_id = m.event_id AND et.tag_slug = :tag)")
+        conditions.append("EXISTS (SELECT 1 FROM event_tags et WHERE et.event_id = m.event_id AND et.tag_slug = %(tag)s)")
         params["tag"] = tag
 
     if q:
-        conditions.append("m.question LIKE :q")
+        conditions.append("m.question LIKE %(q)s")
         params["q"] = f"%{q}%"
 
     if volume_min is not None:
-        conditions.append("m.volume >= :volume_min")
+        conditions.append("m.volume >= %(volume_min)s")
         params["volume_min"] = volume_min
 
     if volume_max is not None:
-        conditions.append("m.volume <= :volume_max")
+        conditions.append("m.volume <= %(volume_max)s")
         params["volume_max"] = volume_max
 
     if liquidity_min is not None:
-        conditions.append("m.liquidity >= :liquidity_min")
+        conditions.append("m.liquidity >= %(liquidity_min)s")
         params["liquidity_min"] = liquidity_min
 
     if liquidity_max is not None:
-        conditions.append("m.liquidity <= :liquidity_max")
+        conditions.append("m.liquidity <= %(liquidity_max)s")
         params["liquidity_max"] = liquidity_max
 
     if spread_min is not None:
-        conditions.append("m.spread >= :spread_min")
+        conditions.append("m.spread >= %(spread_min)s")
         params["spread_min"] = spread_min
 
     if spread_max is not None:
-        conditions.append("m.spread <= :spread_max")
+        conditions.append("m.spread <= %(spread_max)s")
         params["spread_max"] = spread_max
 
     if price_min is not None:
-        conditions.append("m.last_trade_price >= :price_min")
+        conditions.append("m.last_trade_price >= %(price_min)s")
         params["price_min"] = price_min
 
     if price_max is not None:
-        conditions.append("m.last_trade_price <= :price_max")
+        conditions.append("m.last_trade_price <= %(price_max)s")
         params["price_max"] = price_max
 
     if date_from:
-        conditions.append("m.created_at >= :date_from")
+        conditions.append("m.created_at >= %(date_from)s")
         params["date_from"] = date_from
 
     if date_to:
-        conditions.append("m.created_at <= :date_to")
+        conditions.append("m.created_at <= %(date_to)s")
         params["date_to"] = date_to
 
     if outcome_type:
-        conditions.append("m.outcomes LIKE :outcome_type")
+        conditions.append("m.outcomes LIKE %(outcome_type)s")
         params["outcome_type"] = f"%{outcome_type}%"
 
     if end_date_from:
-        conditions.append("m.end_date IS NOT NULL AND m.end_date >= :end_date_from")
+        conditions.append("m.end_date IS NOT NULL AND m.end_date >= %(end_date_from)s")
         params["end_date_from"] = end_date_from
 
     if end_date_to:
-        conditions.append("m.end_date IS NOT NULL AND m.end_date <= :end_date_to")
+        conditions.append("m.end_date IS NOT NULL AND m.end_date <= %(end_date_to)s")
         params["end_date_to"] = end_date_to
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
@@ -134,8 +134,8 @@ def get_markets(conn, status=None, tag=None, q=None, sort="volume",
     params["offset"] = offset
 
     count = conn.execute(
-        f"SELECT COUNT(*) FROM markets m {where}", params
-    ).fetchone()[0]
+        f"SELECT COUNT(*) AS cnt FROM markets m {where}", params
+    ).fetchone()["cnt"]
 
     rows = conn.execute(f"""
         SELECT m.id, m.question, m.event_id, m.last_trade_price, m.volume,
@@ -146,7 +146,7 @@ def get_markets(conn, status=None, tag=None, q=None, sort="volume",
         LEFT JOIN events e ON e.id = m.event_id
         {where}
         ORDER BY {sort_col} {sort_dir} NULLS LAST
-        LIMIT :limit OFFSET :offset
+        LIMIT %(limit)s OFFSET %(offset)s
     """, params).fetchall()
 
     return {
@@ -165,7 +165,7 @@ def get_market(conn, market_id):
                e.tags AS event_tags
         FROM markets m
         LEFT JOIN events e ON e.id = m.event_id
-        WHERE m.id = :id
+        WHERE m.id = %(id)s
     """, {"id": market_id}).fetchone()
     return dict(row) if row else None
 
@@ -176,7 +176,7 @@ def get_market_history(conn, market_id):
         SELECT fetched_at, outcome_prices, volume, liquidity, spread,
                last_trade_price
         FROM price_snapshots
-        WHERE market_id = :id
+        WHERE market_id = %(id)s
         ORDER BY fetched_at
     """, {"id": market_id}).fetchall()
     result = []
@@ -200,7 +200,7 @@ def get_sibling_markets(conn, event_id, exclude_market_id=None):
         SELECT id, question, last_trade_price, volume, liquidity, spread,
                outcomes, outcome_prices, closed
         FROM markets
-        WHERE event_id = :event_id
+        WHERE event_id = %(event_id)s
         ORDER BY volume DESC
     """, {"event_id": event_id}).fetchall()
     return [dict(r) for r in rows]
@@ -209,7 +209,7 @@ def get_sibling_markets(conn, event_id, exclude_market_id=None):
 def get_event(conn, event_id):
     """Single event with all its markets."""
     event = conn.execute(
-        "SELECT * FROM events WHERE id = :id", {"id": event_id}
+        "SELECT * FROM events WHERE id = %(id)s", {"id": event_id}
     ).fetchone()
     if not event:
         return None
@@ -219,7 +219,7 @@ def get_event(conn, event_id):
                outcomes, outcome_prices, closed, one_day_change, one_week_change,
                group_item_title
         FROM markets
-        WHERE event_id = :id
+        WHERE event_id = %(id)s
         ORDER BY volume DESC
     """, {"id": event_id}).fetchall()
     event["markets"] = [dict(m) for m in markets]
@@ -245,7 +245,7 @@ def get_categories(conn, sort="volume"):
                SUM(CASE WHEN m.closed = 1 THEN 1 ELSE 0 END) AS resolved_count
         FROM event_tags et
         JOIN markets m ON m.event_id = et.event_id
-        GROUP BY et.tag_slug
+        GROUP BY et.tag_slug, et.tag_label
         ORDER BY {order}
     """).fetchall()
     return [dict(r) for r in rows]
@@ -257,9 +257,9 @@ def get_category_growth(conn, limit=10):
         SELECT et.tag_slug, et.tag_label
         FROM event_tags et
         JOIN markets m ON m.event_id = et.event_id
-        GROUP BY et.tag_slug
+        GROUP BY et.tag_slug, et.tag_label
         ORDER BY SUM(m.volume) DESC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
 
     if not top_tags:
@@ -268,9 +268,9 @@ def get_category_growth(conn, limit=10):
     tag_slugs = [t["tag_slug"] for t in top_tags]
     tag_labels = [t["tag_label"] for t in top_tags]
 
-    placeholders = ",".join(["?"] * len(tag_slugs))
+    placeholders = ",".join(["%s"] * len(tag_slugs))
     rows = conn.execute(f"""
-        SELECT strftime('%Y-%m', e.created_at) AS period,
+        SELECT to_char(e.created_at::timestamp, 'YYYY-MM') AS period,
                et.tag_slug,
                COALESCE(SUM(m.volume), 0) AS period_volume
         FROM event_tags et
@@ -334,7 +334,7 @@ def get_volume_scatter(conn, x="volume", y="liquidity", sample=5000):
         WHERE {x_col} IS NOT NULL AND {y_col} IS NOT NULL
           AND {x_col} > 0 AND {y_col} > 0
         ORDER BY RANDOM()
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": sample}).fetchall()
     return [dict(r) for r in rows]
 
@@ -350,7 +350,7 @@ def get_movers(conn, period="1d", limit=50):
         LEFT JOIN events e ON e.id = m.event_id
         WHERE m.closed = 0 AND m.{col} IS NOT NULL
         ORDER BY m.{col} DESC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
     losers = conn.execute(f"""
         SELECT m.id, m.question, m.last_trade_price, m.volume,
@@ -359,7 +359,7 @@ def get_movers(conn, period="1d", limit=50):
         LEFT JOIN events e ON e.id = m.event_id
         WHERE m.closed = 0 AND m.{col} IS NOT NULL
         ORDER BY m.{col} ASC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
     return {
         "gainers": [dict(r) for r in gainers],
@@ -377,7 +377,7 @@ def get_momentum_scatter(conn, limit=2000):
           AND m.one_day_change IS NOT NULL
           AND m.one_week_change IS NOT NULL
         ORDER BY m.volume DESC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
     return [dict(r) for r in rows]
 
@@ -391,7 +391,7 @@ def get_newest_markets(conn, limit=50):
         LEFT JOIN events e ON e.id = m.event_id
         WHERE m.closed = 0
         ORDER BY m.created_at DESC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
     return [dict(r) for r in rows]
 
@@ -417,9 +417,10 @@ def get_recent_events(conn, limit=20):
                COUNT(m.id) AS market_count
         FROM events e
         LEFT JOIN markets m ON m.event_id = e.id
-        GROUP BY e.id
+        GROUP BY e.id, e.title, e.volume, e.liquidity, e.closed,
+                 e.created_at, e.tags
         ORDER BY e.created_at DESC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
     return [dict(r) for r in rows]
 
@@ -433,7 +434,7 @@ def get_top_markets_by_volume(conn, limit=50):
         FROM markets m
         LEFT JOIN events e ON e.id = m.event_id
         ORDER BY m.volume DESC
-        LIMIT :limit
+        LIMIT %(limit)s
     """, {"limit": limit}).fetchall()
     return [dict(r) for r in rows]
 
@@ -443,29 +444,25 @@ def get_tags(conn):
     rows = conn.execute("""
         SELECT tag_label, tag_slug, COUNT(*) AS event_count
         FROM event_tags
-        GROUP BY tag_slug
+        GROUP BY tag_slug, tag_label
         ORDER BY event_count DESC
     """).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_calibration_data(conn, category=None, volume_min=None):
-    """Get resolved markets with pre-resolution snapshot prices for calibration.
-
-    Uses INNER JOIN to only return markets that have meaningful snapshot data
-    (price between 0.01 and 0.99, i.e. not already resolved at snapshot time).
-    """
+    """Get resolved markets with pre-resolution snapshot prices for calibration."""
     conditions = ["m.closed = 1", "m.last_trade_price IS NOT NULL"]
     params = {}
 
     if category:
         conditions.append(
-            "EXISTS (SELECT 1 FROM event_tags et WHERE et.event_id = m.event_id AND et.tag_slug = :category)"
+            "EXISTS (SELECT 1 FROM event_tags et WHERE et.event_id = m.event_id AND et.tag_slug = %(category)s)"
         )
         params["category"] = category
 
     if volume_min is not None:
-        conditions.append("m.volume >= :volume_min")
+        conditions.append("m.volume >= %(volume_min)s")
         params["volume_min"] = volume_min
 
     where = " AND ".join(conditions)
@@ -480,10 +477,10 @@ def get_calibration_data(conn, category=None, volume_min=None):
                    ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY fetched_at ASC) AS rn
             FROM price_snapshots
             WHERE outcome_prices IS NOT NULL
-              AND outcome_prices NOT LIKE '%"0"%'
-              AND outcome_prices NOT LIKE '%"1"%'
-              AND outcome_prices NOT LIKE '%"0.0"%'
-              AND outcome_prices NOT LIKE '%"1.0"%'
+              AND outcome_prices NOT LIKE '%%"0"%%'
+              AND outcome_prices NOT LIKE '%%"1"%%'
+              AND outcome_prices NOT LIKE '%%"0.0"%%'
+              AND outcome_prices NOT LIKE '%%"1.0"%%'
         ) ps ON ps.market_id = m.id AND ps.rn = 1
         WHERE {where}
         ORDER BY m.volume DESC
@@ -567,7 +564,7 @@ def get_calibration_overview(conn):
 def get_monthly_volume(conn):
     """Monthly volume timeline from markets."""
     rows = conn.execute("""
-        SELECT strftime('%Y-%m', created_at) AS period,
+        SELECT to_char(created_at::timestamp, 'YYYY-MM') AS period,
                COALESCE(SUM(volume), 0) AS total_volume,
                COUNT(*) AS market_count
         FROM markets
@@ -611,8 +608,8 @@ def get_category_resolution_rates(conn):
                SUM(CASE WHEN m.closed = 1 THEN 1 ELSE 0 END) AS total_resolved
         FROM event_tags et
         JOIN markets m ON m.event_id = et.event_id
-        GROUP BY et.tag_slug
-        HAVING total_resolved > 10
+        GROUP BY et.tag_slug, et.tag_label
+        HAVING SUM(CASE WHEN m.closed = 1 THEN 1 ELSE 0 END) > 10
         ORDER BY SUM(m.volume) DESC
     """).fetchall()
     return [dict(r) for r in rows]
