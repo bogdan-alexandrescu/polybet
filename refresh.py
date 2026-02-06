@@ -206,7 +206,65 @@ def run_refresh(source="web"):
 
         init_db(data_conn)
 
-        # Phase 1: Fetch open events
+        now = datetime.now(timezone.utc).isoformat()
+        counters = {
+            "processed_events": 0,
+            "new_events": 0,
+            "updated_events": 0,
+            "skipped_events": 0,
+            "new_markets": 0,
+            "updated_markets": 0,
+            "snapshots": 0,
+        }
+        flush_interval = 10
+        data_commit_interval = 100
+        total = 0
+
+        def upsert_batch(events, known_closed_ids, counter_offset):
+            """Upsert a batch of events, committing incrementally."""
+            nonlocal total
+            for i, event in enumerate(events):
+                if is_cancelled(state_conn, job_id):
+                    data_conn.commit()
+                    update_job(state_conn, job_id, status="cancelled", phase="cancelled",
+                               finished_at=datetime.now(timezone.utc), **counters)
+                    print("Refresh cancelled.")
+                    return False
+
+                is_closed = event.get("closed", False)
+
+                if is_closed and event.get("id") in known_closed_ids:
+                    counters["skipped_events"] += 1
+                    counters["processed_events"] += 1
+                    if (i + 1) % flush_interval == 0:
+                        update_job(state_conn, job_id, **counters)
+                    continue
+
+                upsert_event(data_conn, event, now)
+                counters["new_events"] += 1
+
+                for market in event.get("markets", []):
+                    upsert_market(data_conn, market, event["id"], now)
+                    counters["new_markets"] += 1
+
+                    if not is_closed:
+                        insert_snapshot(data_conn, market, now)
+                        counters["snapshots"] += 1
+
+                counters["processed_events"] += 1
+
+                if (i + 1) % data_commit_interval == 0:
+                    data_conn.commit()
+                    print(f"  Committed batch: {counters['processed_events']}/{total} events...")
+
+                if (i + 1) % flush_interval == 0:
+                    update_job(state_conn, job_id, **counters)
+
+            data_conn.commit()
+            update_job(state_conn, job_id, **counters)
+            return True
+
+        # Phase 1: Fetch + upsert open events
         update_job(state_conn, job_id, phase="fetching_open")
         print("Fetching open events from Polymarket API...")
         open_events = fetch_all_events(closed=False, label="[open] ")
@@ -217,7 +275,14 @@ def run_refresh(source="web"):
             print("Refresh cancelled.")
             return
 
-        # Phase 2: Fetch closed events
+        total = len(open_events)
+        update_job(state_conn, job_id, total_events=total, phase="upserting_open")
+        print(f"Upserting {len(open_events)} open events...")
+        if not upsert_batch(open_events, set(), 0):
+            return
+        print(f"Open events committed — {counters['new_markets']} markets now visible.")
+
+        # Phase 2: Fetch + upsert closed events
         update_job(state_conn, job_id, phase="fetching_closed")
         print("Fetching closed events from Polymarket API...")
 
@@ -233,66 +298,11 @@ def run_refresh(source="web"):
             print("Refresh cancelled.")
             return
 
-        all_events = open_events + closed_events
-        total = len(all_events)
-        update_job(state_conn, job_id, total_events=total, phase="upserting")
-        print(f"Processing {total} events...")
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        # Phase 3: Upsert events + markets (batched counter updates)
-        counters = {
-            "processed_events": 0,
-            "new_events": 0,
-            "updated_events": 0,
-            "skipped_events": 0,
-            "new_markets": 0,
-            "updated_markets": 0,
-            "snapshots": 0,
-        }
-        flush_interval = 10
-        data_commit_interval = 100
-
-        for i, event in enumerate(all_events):
-            if is_cancelled(state_conn, job_id):
-                data_conn.commit()
-                update_job(state_conn, job_id, status="cancelled", phase="cancelled",
-                           finished_at=datetime.now(timezone.utc), **counters)
-                print("Refresh cancelled.")
-                return
-
-            is_closed = event.get("closed", False)
-
-            if is_closed and event.get("id") in known_closed_ids:
-                counters["skipped_events"] += 1
-                counters["processed_events"] += 1
-                if (i + 1) % flush_interval == 0:
-                    update_job(state_conn, job_id, **counters)
-                continue
-
-            upsert_event(data_conn, event, now)
-            counters["new_events"] += 1
-
-            for market in event.get("markets", []):
-                upsert_market(data_conn, market, event["id"], now)
-                counters["new_markets"] += 1
-
-                if not is_closed:
-                    insert_snapshot(data_conn, market, now)
-                    counters["snapshots"] += 1
-
-            counters["processed_events"] += 1
-
-            if (i + 1) % data_commit_interval == 0:
-                data_conn.commit()
-                print(f"  Committed batch: {counters['processed_events']}/{total} events...")
-
-            if (i + 1) % flush_interval == 0:
-                update_job(state_conn, job_id, **counters)
-
-        # Final commit + counter flush
-        data_conn.commit()
-        update_job(state_conn, job_id, **counters)
+        total += len(closed_events)
+        update_job(state_conn, job_id, total_events=total, phase="upserting_closed")
+        print(f"Upserting {len(closed_events)} closed events ({len(known_closed_ids)} already in DB, will skip)...")
+        if not upsert_batch(closed_events, known_closed_ids, len(open_events)):
+            return
         print(f"Done: {counters['new_events']} events, {counters['new_markets']} markets, {counters['snapshots']} snapshots.")
 
         # Phase 4: Rebuild tag table

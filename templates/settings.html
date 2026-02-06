@@ -340,7 +340,9 @@
 
     const phaseLabels = {
         'fetching_open': 'Fetching open events...',
+        'upserting_open': 'Upserting open events & markets...',
         'fetching_closed': 'Fetching closed events...',
+        'upserting_closed': 'Upserting closed events & markets...',
         'upserting': 'Processing events & markets...',
         'building_tags': 'Rebuilding tag index...',
         'done': 'Refresh complete!',
@@ -362,16 +364,26 @@
     }
 
     function calculateProgress(state) {
-        // Multi-phase progress: fetch_open 0-15%, fetch_closed 15-35%, upsert 35-90%, tags 90-99%, done 100%
+        // Phases: fetch_open 0-5%, upsert_open 5-25%, fetch_closed 25-35%, upsert_closed 35-90%, tags 92%, done 100%
         if (state.phase === 'done') return 100;
         if (state.phase === 'error' || state.phase === 'cancelled') return 100;
         if (state.phase === 'fetching_open') {
-            // Estimate ~7000 open events typical
-            return Math.min(14, Math.round((fetchedOpenCount / 7000) * 15));
+            return Math.min(4, Math.round((fetchedOpenCount / 7000) * 5));
+        }
+        if (state.phase === 'upserting_open') {
+            if (state.total_events > 0) {
+                return 5 + Math.round((state.processed_events / state.total_events) * 20);
+            }
+            return 5;
         }
         if (state.phase === 'fetching_closed') {
-            // Estimate ~30000 closed events typical
-            return 15 + Math.min(19, Math.round((fetchedClosedCount / 30000) * 20));
+            return 25 + Math.min(9, Math.round((fetchedClosedCount / 30000) * 10));
+        }
+        if (state.phase === 'upserting_closed') {
+            if (state.total_events > 0) {
+                return 35 + Math.round((state.processed_events / state.total_events) * 55);
+            }
+            return 35;
         }
         if (state.phase === 'upserting') {
             if (state.total_events > 0) {
@@ -389,6 +401,7 @@
         const pct = calculateProgress(state);
         const bar = document.getElementById('progressBar');
         const isFetching = state.phase === 'fetching_open' || state.phase === 'fetching_closed';
+        const isUpserting = state.phase === 'upserting_open' || state.phase === 'upserting_closed' || state.phase === 'upserting';
 
         document.getElementById('phaseLabel').textContent = phaseLabels[state.phase] || state.phase;
         document.getElementById('progressPct').textContent = pct + '%';
