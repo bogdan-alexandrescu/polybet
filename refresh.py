@@ -251,9 +251,11 @@ def run_refresh(source="web"):
             "snapshots": 0,
         }
         flush_interval = 10
+        data_commit_interval = 100
 
         for i, event in enumerate(all_events):
             if is_cancelled(state_conn, job_id):
+                data_conn.commit()
                 update_job(state_conn, job_id, status="cancelled", phase="cancelled",
                            finished_at=datetime.now(timezone.utc), **counters)
                 print("Refresh cancelled.")
@@ -281,15 +283,17 @@ def run_refresh(source="web"):
 
             counters["processed_events"] += 1
 
+            if (i + 1) % data_commit_interval == 0:
+                data_conn.commit()
+                print(f"  Committed batch: {counters['processed_events']}/{total} events...")
+
             if (i + 1) % flush_interval == 0:
                 update_job(state_conn, job_id, **counters)
-                print(f"  Processed {counters['processed_events']}/{total} events...")
 
-        # Final counter flush
-        update_job(state_conn, job_id, **counters)
-
+        # Final commit + counter flush
         data_conn.commit()
-        print(f"Committed {counters['new_events']} events, {counters['new_markets']} markets, {counters['snapshots']} snapshots.")
+        update_job(state_conn, job_id, **counters)
+        print(f"Done: {counters['new_events']} events, {counters['new_markets']} markets, {counters['snapshots']} snapshots.")
 
         # Phase 4: Rebuild tag table
         update_job(state_conn, job_id, phase="building_tags")
