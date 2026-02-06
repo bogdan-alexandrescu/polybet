@@ -1,10 +1,13 @@
 """Polybet — Polymarket Analytics Web Application."""
 
 import json
+import os
+import threading
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
+from functools import wraps
 
-from db import get_connection, init_analytics_db
+from db import get_connection, return_connection, init_analytics_db
 from queries import (
     get_calibration_data,
     get_calibration_overview,
@@ -37,8 +40,9 @@ from analytics import (
     compute_histogram,
     compute_lorenz,
 )
+from refresh import get_state, request_cancel, run_refresh, sse_generator
 
-app = Flask(__name__)
+SETTINGS_PASSWORD = os.environ.get("SETTINGS_PASSWORD", "admin")
 
 
 def parse_tags(tags_json):
@@ -52,96 +56,118 @@ def parse_tags(tags_json):
         return []
 
 
-app.jinja_env.filters["parse_tags"] = parse_tags
+def require_auth(f):
+    """Simple password auth decorator for settings endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("X-Settings-Password")
+        if auth != SETTINGS_PASSWORD:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 
-# ---------------------------------------------------------------------------
-# Page routes
-# ---------------------------------------------------------------------------
-
-@app.route("/")
-def dashboard():
-    return render_template("dashboard.html", active_page="dashboard")
+def get_db():
+    """Get a database connection, storing it on Flask g for the request."""
+    if "db" not in g:
+        g.db = get_connection()
+    return g.db
 
 
-@app.route("/markets")
-def markets_page():
-    return render_template("markets.html", active_page="markets")
-
-
-@app.route("/market/<market_id>")
-def market_detail_page(market_id):
-    conn = get_connection()
+def _float(val):
+    if val is None:
+        return None
     try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _int(val, default=0):
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def create_app():
+    app = Flask(__name__)
+    app.jinja_env.filters["parse_tags"] = parse_tags
+
+    @app.teardown_appcontext
+    def close_db(exception):
+        conn = g.pop("db", None)
+        if conn is not None:
+            return_connection(conn)
+
+    with app.app_context():
+        init_analytics_db()
+
+    # -------------------------------------------------------------------
+    # Page routes
+    # -------------------------------------------------------------------
+
+    @app.route("/")
+    def dashboard():
+        return render_template("dashboard.html", active_page="dashboard")
+
+    @app.route("/markets")
+    def markets_page():
+        return render_template("markets.html", active_page="markets")
+
+    @app.route("/market/<market_id>")
+    def market_detail_page(market_id):
+        conn = get_db()
         market = get_market(conn, market_id)
         if not market:
             return "Market not found", 404
         return render_template("market_detail.html", market=market, active_page="markets")
-    finally:
-        conn.close()
 
-
-@app.route("/event/<event_id>")
-def event_detail_page(event_id):
-    conn = get_connection()
-    try:
+    @app.route("/event/<event_id>")
+    def event_detail_page(event_id):
+        conn = get_db()
         event = get_event(conn, event_id)
         if not event:
             return "Event not found", 404
         return render_template("event_detail.html", event=event, active_page="")
-    finally:
-        conn.close()
 
+    @app.route("/categories")
+    def categories_page():
+        return render_template("categories.html", active_page="categories")
 
-@app.route("/categories")
-def categories_page():
-    return render_template("categories.html", active_page="categories")
+    @app.route("/volume")
+    def volume_page():
+        return render_template("volume.html", active_page="volume")
 
+    @app.route("/movers")
+    def movers_page():
+        return render_template("movers.html", active_page="movers")
 
-@app.route("/volume")
-def volume_page():
-    return render_template("volume.html", active_page="volume")
+    @app.route("/calibration")
+    def calibration_page():
+        return render_template("calibration.html", active_page="calibration")
 
+    @app.route("/settings")
+    def settings_page():
+        return render_template("settings.html", active_page="settings")
 
-@app.route("/movers")
-def movers_page():
-    return render_template("movers.html", active_page="movers")
+    # -------------------------------------------------------------------
+    # API routes
+    # -------------------------------------------------------------------
 
+    @app.route("/api/stats")
+    def api_stats():
+        return jsonify(get_stats(get_db()))
 
-@app.route("/calibration")
-def calibration_page():
-    return render_template("calibration.html", active_page="calibration")
-
-
-# ---------------------------------------------------------------------------
-# API routes
-# ---------------------------------------------------------------------------
-
-@app.route("/api/stats")
-def api_stats():
-    conn = get_connection()
-    try:
-        return jsonify(get_stats(conn))
-    finally:
-        conn.close()
-
-
-@app.route("/api/growth")
-def api_growth():
-    conn = get_connection()
-    try:
+    @app.route("/api/growth")
+    def api_growth():
         granularity = request.args.get("granularity", "month")
-        return jsonify(get_growth(conn, granularity))
-    finally:
-        conn.close()
+        return jsonify(get_growth(get_db(), granularity))
 
-
-@app.route("/api/markets")
-def api_markets():
-    conn = get_connection()
-    try:
+    @app.route("/api/markets")
+    def api_markets():
         result = get_markets(
-            conn,
+            get_db(),
             status=request.args.get("status"),
             tag=request.args.get("tag"),
             q=request.args.get("q"),
@@ -164,246 +190,185 @@ def api_markets():
             end_date_to=request.args.get("end_date_to"),
         )
         return jsonify(result)
-    finally:
-        conn.close()
 
-
-@app.route("/api/market/<market_id>")
-def api_market(market_id):
-    conn = get_connection()
-    try:
-        market = get_market(conn, market_id)
+    @app.route("/api/market/<market_id>")
+    def api_market(market_id):
+        market = get_market(get_db(), market_id)
         if not market:
             return jsonify({"error": "Not found"}), 404
         return jsonify(market)
-    finally:
-        conn.close()
 
+    @app.route("/api/market/<market_id>/history")
+    def api_market_history(market_id):
+        return jsonify(get_market_history(get_db(), market_id))
 
-@app.route("/api/market/<market_id>/history")
-def api_market_history(market_id):
-    conn = get_connection()
-    try:
-        return jsonify(get_market_history(conn, market_id))
-    finally:
-        conn.close()
-
-
-@app.route("/api/market/<market_id>/siblings")
-def api_market_siblings(market_id):
-    conn = get_connection()
-    try:
-        market = get_market(conn, market_id)
+    @app.route("/api/market/<market_id>/siblings")
+    def api_market_siblings(market_id):
+        market = get_market(get_db(), market_id)
         if not market:
             return jsonify([])
-        return jsonify(get_sibling_markets(conn, market["event_id"]))
-    finally:
-        conn.close()
+        return jsonify(get_sibling_markets(get_db(), market["event_id"]))
 
-
-@app.route("/api/event/<event_id>")
-def api_event(event_id):
-    conn = get_connection()
-    try:
-        event = get_event(conn, event_id)
+    @app.route("/api/event/<event_id>")
+    def api_event(event_id):
+        event = get_event(get_db(), event_id)
         if not event:
             return jsonify({"error": "Not found"}), 404
         return jsonify(event)
-    finally:
-        conn.close()
 
-
-@app.route("/api/categories")
-def api_categories():
-    conn = get_connection()
-    try:
+    @app.route("/api/categories")
+    def api_categories():
         sort = request.args.get("sort", "volume")
-        return jsonify(get_categories(conn, sort))
-    finally:
-        conn.close()
+        return jsonify(get_categories(get_db(), sort))
 
+    @app.route("/api/categories/growth")
+    def api_category_growth():
+        return jsonify(get_category_growth(get_db()))
 
-@app.route("/api/categories/growth")
-def api_category_growth():
-    conn = get_connection()
-    try:
-        return jsonify(get_category_growth(conn))
-    finally:
-        conn.close()
+    @app.route("/api/categories/resolution_rates")
+    def api_category_resolution_rates():
+        return jsonify(get_category_resolution_rates(get_db()))
 
-
-@app.route("/api/categories/resolution_rates")
-def api_category_resolution_rates():
-    conn = get_connection()
-    try:
-        return jsonify(get_category_resolution_rates(conn))
-    finally:
-        conn.close()
-
-
-@app.route("/api/calibration")
-def api_calibration():
-    conn = get_connection()
-    try:
+    @app.route("/api/calibration")
+    def api_calibration():
+        conn = get_db()
         category = request.args.get("category")
         volume_min = _float(request.args.get("volume_min"))
         data = get_calibration_data(conn, category=category, volume_min=volume_min)
         result = compute_calibration(data)
         result["by_volume_tier"] = compute_calibration_by_volume_tier(data)
         return jsonify(result)
-    finally:
-        conn.close()
 
-
-@app.route("/api/calibration/overview")
-def api_calibration_overview():
-    conn = get_connection()
-    try:
-        overview = get_calibration_overview(conn)
-        # Compute open market price histogram server-side
+    @app.route("/api/calibration/overview")
+    def api_calibration_overview():
+        overview = get_calibration_overview(get_db())
         open_prices = overview.pop("open_prices", [])
         overview["open_price_distribution"] = compute_histogram(open_prices, n_bins=20)
         return jsonify(overview)
-    finally:
-        conn.close()
 
+    @app.route("/api/volume/distribution")
+    def api_volume_distribution():
+        return jsonify(get_volume_distribution(get_db()))
 
-@app.route("/api/volume/distribution")
-def api_volume_distribution():
-    conn = get_connection()
-    try:
-        return jsonify(get_volume_distribution(conn))
-    finally:
-        conn.close()
-
-
-@app.route("/api/volume/scatter")
-def api_volume_scatter():
-    conn = get_connection()
-    try:
+    @app.route("/api/volume/scatter")
+    def api_volume_scatter():
         x = request.args.get("x", "volume")
         y = request.args.get("y", "liquidity")
         sample = int(request.args.get("sample", 5000))
-        return jsonify(get_volume_scatter(conn, x, y, sample))
-    finally:
-        conn.close()
+        return jsonify(get_volume_scatter(get_db(), x, y, sample))
 
-
-@app.route("/api/volume/lorenz")
-def api_volume_lorenz():
-    conn = get_connection()
-    try:
-        volumes = get_volume_lorenz(conn)
+    @app.route("/api/volume/lorenz")
+    def api_volume_lorenz():
+        volumes = get_volume_lorenz(get_db())
         return jsonify(compute_lorenz(volumes))
-    finally:
-        conn.close()
 
+    @app.route("/api/volume/monthly")
+    def api_volume_monthly():
+        return jsonify(get_monthly_volume(get_db()))
 
-@app.route("/api/volume/monthly")
-def api_volume_monthly():
-    conn = get_connection()
-    try:
-        return jsonify(get_monthly_volume(conn))
-    finally:
-        conn.close()
-
-
-@app.route("/api/volume/top")
-def api_volume_top():
-    conn = get_connection()
-    try:
+    @app.route("/api/volume/top")
+    def api_volume_top():
         limit = int(request.args.get("limit", 50))
-        return jsonify(get_top_markets_by_volume(conn, limit))
-    finally:
-        conn.close()
+        return jsonify(get_top_markets_by_volume(get_db(), limit))
 
-
-@app.route("/api/movers")
-def api_movers():
-    conn = get_connection()
-    try:
+    @app.route("/api/movers")
+    def api_movers():
         period = request.args.get("period", "1d")
         limit = int(request.args.get("limit", 50))
-        return jsonify(get_movers(conn, period, limit))
-    finally:
-        conn.close()
+        return jsonify(get_movers(get_db(), period, limit))
 
-
-@app.route("/api/movers/momentum")
-def api_momentum():
-    conn = get_connection()
-    try:
+    @app.route("/api/movers/momentum")
+    def api_momentum():
         limit = int(request.args.get("limit", 2000))
-        return jsonify(get_momentum_scatter(conn, limit))
-    finally:
-        conn.close()
+        return jsonify(get_momentum_scatter(get_db(), limit))
 
-
-@app.route("/api/movers/distribution")
-def api_movers_distribution():
-    conn = get_connection()
-    try:
+    @app.route("/api/movers/distribution")
+    def api_movers_distribution():
         period = request.args.get("period", "1d")
-        changes = get_price_change_distribution(conn, period)
+        changes = get_price_change_distribution(get_db(), period)
         return jsonify(compute_histogram(changes))
-    finally:
-        conn.close()
 
-
-@app.route("/api/movers/newest")
-def api_newest():
-    conn = get_connection()
-    try:
+    @app.route("/api/movers/newest")
+    def api_newest():
         limit = int(request.args.get("limit", 50))
-        return jsonify(get_newest_markets(conn, limit))
-    finally:
-        conn.close()
+        return jsonify(get_newest_markets(get_db(), limit))
 
+    @app.route("/api/resolution")
+    def api_resolution():
+        return jsonify(get_resolution_breakdown(get_db()))
 
-@app.route("/api/resolution")
-def api_resolution():
-    conn = get_connection()
-    try:
-        return jsonify(get_resolution_breakdown(conn))
-    finally:
-        conn.close()
-
-
-@app.route("/api/recent_events")
-def api_recent_events():
-    conn = get_connection()
-    try:
+    @app.route("/api/recent_events")
+    def api_recent_events():
         limit = int(request.args.get("limit", 20))
-        return jsonify(get_recent_events(conn, limit))
-    finally:
-        conn.close()
+        return jsonify(get_recent_events(get_db(), limit))
+
+    @app.route("/api/tags")
+    def api_tags():
+        return jsonify(get_tags(get_db()))
+
+    # -------------------------------------------------------------------
+    # Settings API
+    # -------------------------------------------------------------------
+
+    @app.route("/api/settings", methods=["GET"])
+    @require_auth
+    def api_get_settings():
+        conn = get_db()
+        rows = conn.execute("SELECT key, value FROM settings").fetchall()
+        return jsonify({r["key"]: r["value"] for r in rows})
+
+    @app.route("/api/settings", methods=["POST"])
+    @require_auth
+    def api_update_settings():
+        conn = get_db()
+        data = request.get_json()
+        for key, value in data.items():
+            conn.execute("""
+                INSERT INTO settings (key, value, updated_at)
+                VALUES (%(key)s, %(value)s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = %(value)s, updated_at = NOW()
+            """, {"key": key, "value": value})
+        conn.commit()
+        return jsonify({"status": "ok"})
+
+    # -------------------------------------------------------------------
+    # Refresh API
+    # -------------------------------------------------------------------
+
+    @app.route("/api/refresh/start", methods=["POST"])
+    @require_auth
+    def api_refresh_start():
+        state = get_state()
+        if state["running"]:
+            return jsonify({"error": "Refresh already running"}), 409
+        t = threading.Thread(target=run_refresh, daemon=True)
+        t.start()
+        return jsonify({"status": "started"})
+
+    @app.route("/api/refresh/cancel", methods=["POST"])
+    @require_auth
+    def api_refresh_cancel():
+        if request_cancel():
+            return jsonify({"status": "cancel_requested"})
+        return jsonify({"error": "No refresh running"}), 409
+
+    @app.route("/api/refresh/status")
+    def api_refresh_status():
+        return jsonify(get_state())
+
+    @app.route("/api/refresh/stream")
+    def api_refresh_stream():
+        return Response(
+            sse_generator(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    return app
 
 
-@app.route("/api/tags")
-def api_tags():
-    conn = get_connection()
-    try:
-        return jsonify(get_tags(conn))
-    finally:
-        conn.close()
-
-
-def _float(val):
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
-
-def _int(val, default=0):
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
+app = create_app()
 
 
 if __name__ == "__main__":
-    init_analytics_db()
     app.run(host="0.0.0.0", port=5001, debug=True)

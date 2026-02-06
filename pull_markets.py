@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pull all open markets from Polymarket and cache them in a local SQLite database.
+"""Pull all open markets from Polymarket and cache them in PostgreSQL.
 
 On each run:
   - Fetches all open events/markets from the Gamma API
@@ -9,14 +9,13 @@ On each run:
 """
 
 import json
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 
+from db import get_connection, return_connection
+
 GAMMA_API = "https://gamma-api.polymarket.com"
-DB_PATH = Path(__file__).parent / "polybet.db"
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +23,7 @@ DB_PATH = Path(__file__).parent / "polybet.db"
 # ---------------------------------------------------------------------------
 
 def init_db(conn):
-    conn.executescript("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id              TEXT PRIMARY KEY,
             ticker          TEXT,
@@ -44,13 +43,15 @@ def init_db(conn):
             volume_1yr      REAL,
             open_interest   INTEGER,
             comment_count   INTEGER,
-            tags            TEXT,       -- JSON array
+            tags            TEXT,
             created_at      TEXT,
             updated_at      TEXT,
             first_seen      TEXT NOT NULL,
             last_synced     TEXT NOT NULL
-        );
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS markets (
             id                  TEXT PRIMARY KEY,
             event_id            TEXT REFERENCES events(id),
@@ -59,8 +60,8 @@ def init_db(conn):
             condition_id        TEXT,
             description         TEXT,
             group_item_title    TEXT,
-            outcomes            TEXT,       -- JSON array e.g. '["Yes","No"]'
-            outcome_prices      TEXT,       -- JSON array e.g. '[0.65, 0.35]'
+            outcomes            TEXT,
+            outcome_prices      TEXT,
             volume              REAL,
             volume_clob         REAL,
             volume_1wk          REAL,
@@ -78,39 +79,42 @@ def init_db(conn):
             active              INTEGER,
             closed              INTEGER,
             neg_risk            INTEGER,
-            clob_token_ids      TEXT,       -- JSON array
+            clob_token_ids      TEXT,
             accepting_orders    INTEGER,
             created_at          TEXT,
             updated_at          TEXT,
             first_seen          TEXT NOT NULL,
             last_synced         TEXT NOT NULL
-        );
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS price_snapshots (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              SERIAL PRIMARY KEY,
             market_id       TEXT NOT NULL REFERENCES markets(id),
-            outcome_prices  TEXT,       -- JSON array
+            outcome_prices  TEXT,
             volume          REAL,
             liquidity       REAL,
             spread          REAL,
             best_ask        REAL,
             last_trade_price REAL,
             fetched_at      TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_snapshots_market
-            ON price_snapshots(market_id, fetched_at);
-        CREATE INDEX IF NOT EXISTS idx_markets_event
-            ON markets(event_id);
+        )
     """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_snapshots_market
+            ON price_snapshots(market_id, fetched_at)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_markets_event
+            ON markets(event_id)
+    """)
+    conn.commit()
 
 
 def upsert_event(conn, event, now):
-    """Insert or update an event row. Returns True if newly inserted."""
-    existing = conn.execute(
-        "SELECT id FROM events WHERE id = ?", (event["id"],)
-    ).fetchone()
-
+    """Insert or update an event row using ON CONFLICT. Returns True if newly inserted."""
     values = {
         "id":             event.get("id"),
         "ticker":         event.get("ticker"),
@@ -133,27 +137,38 @@ def upsert_event(conn, event, now):
         "tags":           json.dumps(event.get("tags", [])),
         "created_at":     event.get("createdAt"),
         "updated_at":     event.get("updatedAt"),
+        "first_seen":     now,
         "last_synced":    now,
     }
 
-    if existing:
-        sets = ", ".join(f"{k} = :{k}" for k in values if k != "id")
-        conn.execute(f"UPDATE events SET {sets} WHERE id = :id", values)
-        return False
-    else:
-        values["first_seen"] = now
-        cols = ", ".join(values.keys())
-        placeholders = ", ".join(f":{k}" for k in values)
-        conn.execute(f"INSERT INTO events ({cols}) VALUES ({placeholders})", values)
-        return True
+    result = conn.execute("""
+        INSERT INTO events (id, ticker, slug, title, description, start_date, end_date,
+            active, closed, neg_risk, liquidity, volume, volume_24hr, volume_1wk,
+            volume_1mo, volume_1yr, open_interest, comment_count, tags, created_at,
+            updated_at, first_seen, last_synced)
+        VALUES (%(id)s, %(ticker)s, %(slug)s, %(title)s, %(description)s, %(start_date)s,
+            %(end_date)s, %(active)s, %(closed)s, %(neg_risk)s, %(liquidity)s, %(volume)s,
+            %(volume_24hr)s, %(volume_1wk)s, %(volume_1mo)s, %(volume_1yr)s,
+            %(open_interest)s, %(comment_count)s, %(tags)s, %(created_at)s,
+            %(updated_at)s, %(first_seen)s, %(last_synced)s)
+        ON CONFLICT (id) DO UPDATE SET
+            ticker = EXCLUDED.ticker, slug = EXCLUDED.slug, title = EXCLUDED.title,
+            description = EXCLUDED.description, start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date, active = EXCLUDED.active, closed = EXCLUDED.closed,
+            neg_risk = EXCLUDED.neg_risk, liquidity = EXCLUDED.liquidity, volume = EXCLUDED.volume,
+            volume_24hr = EXCLUDED.volume_24hr, volume_1wk = EXCLUDED.volume_1wk,
+            volume_1mo = EXCLUDED.volume_1mo, volume_1yr = EXCLUDED.volume_1yr,
+            open_interest = EXCLUDED.open_interest, comment_count = EXCLUDED.comment_count,
+            tags = EXCLUDED.tags, created_at = EXCLUDED.created_at,
+            updated_at = EXCLUDED.updated_at, last_synced = EXCLUDED.last_synced
+    """, values)
+
+    # xmax = 0 means the row was inserted (not updated)
+    return result.statusmessage.startswith("INSERT") and result.rowcount == 1
 
 
 def upsert_market(conn, market, event_id, now):
-    """Insert or update a market row. Returns True if newly inserted."""
-    existing = conn.execute(
-        "SELECT id FROM markets WHERE id = ?", (market["id"],)
-    ).fetchone()
-
+    """Insert or update a market row using ON CONFLICT. Returns True if newly inserted."""
     values = {
         "id":                market.get("id"),
         "event_id":          event_id,
@@ -185,26 +200,48 @@ def upsert_market(conn, market, event_id, now):
         "accepting_orders":  int(market.get("acceptingOrders", False)),
         "created_at":        market.get("createdAt"),
         "updated_at":        market.get("updatedAt"),
+        "first_seen":        now,
         "last_synced":       now,
     }
 
-    if existing:
-        sets = ", ".join(f"{k} = :{k}" for k in values if k != "id")
-        conn.execute(f"UPDATE markets SET {sets} WHERE id = :id", values)
-        return False
-    else:
-        values["first_seen"] = now
-        cols = ", ".join(values.keys())
-        placeholders = ", ".join(f":{k}" for k in values)
-        conn.execute(f"INSERT INTO markets ({cols}) VALUES ({placeholders})", values)
-        return True
+    conn.execute("""
+        INSERT INTO markets (id, event_id, question, slug, condition_id, description,
+            group_item_title, outcomes, outcome_prices, volume, volume_clob, volume_1wk,
+            volume_1mo, volume_1yr, liquidity, spread, best_ask, last_trade_price,
+            one_day_change, one_week_change, one_month_change, start_date, end_date,
+            active, closed, neg_risk, clob_token_ids, accepting_orders, created_at,
+            updated_at, first_seen, last_synced)
+        VALUES (%(id)s, %(event_id)s, %(question)s, %(slug)s, %(condition_id)s,
+            %(description)s, %(group_item_title)s, %(outcomes)s, %(outcome_prices)s,
+            %(volume)s, %(volume_clob)s, %(volume_1wk)s, %(volume_1mo)s, %(volume_1yr)s,
+            %(liquidity)s, %(spread)s, %(best_ask)s, %(last_trade_price)s,
+            %(one_day_change)s, %(one_week_change)s, %(one_month_change)s,
+            %(start_date)s, %(end_date)s, %(active)s, %(closed)s, %(neg_risk)s,
+            %(clob_token_ids)s, %(accepting_orders)s, %(created_at)s, %(updated_at)s,
+            %(first_seen)s, %(last_synced)s)
+        ON CONFLICT (id) DO UPDATE SET
+            event_id = EXCLUDED.event_id, question = EXCLUDED.question, slug = EXCLUDED.slug,
+            condition_id = EXCLUDED.condition_id, description = EXCLUDED.description,
+            group_item_title = EXCLUDED.group_item_title, outcomes = EXCLUDED.outcomes,
+            outcome_prices = EXCLUDED.outcome_prices, volume = EXCLUDED.volume,
+            volume_clob = EXCLUDED.volume_clob, volume_1wk = EXCLUDED.volume_1wk,
+            volume_1mo = EXCLUDED.volume_1mo, volume_1yr = EXCLUDED.volume_1yr,
+            liquidity = EXCLUDED.liquidity, spread = EXCLUDED.spread,
+            best_ask = EXCLUDED.best_ask, last_trade_price = EXCLUDED.last_trade_price,
+            one_day_change = EXCLUDED.one_day_change, one_week_change = EXCLUDED.one_week_change,
+            one_month_change = EXCLUDED.one_month_change, start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date, active = EXCLUDED.active, closed = EXCLUDED.closed,
+            neg_risk = EXCLUDED.neg_risk, clob_token_ids = EXCLUDED.clob_token_ids,
+            accepting_orders = EXCLUDED.accepting_orders, created_at = EXCLUDED.created_at,
+            updated_at = EXCLUDED.updated_at, last_synced = EXCLUDED.last_synced
+    """, values)
 
 
 def insert_snapshot(conn, market, now):
     conn.execute(
         """INSERT INTO price_snapshots
            (market_id, outcome_prices, volume, liquidity, spread, best_ask, last_trade_price, fetched_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             market.get("id"),
             market.get("outcomePrices"),
@@ -267,80 +304,76 @@ def fetch_all_events(page_size=100, closed=None, label=""):
 def main():
     now = datetime.now(timezone.utc).isoformat()
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    init_db(conn)
+    conn = get_connection()
+    try:
+        init_db(conn)
 
-    # Check what we already have
-    prev_event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    prev_market_count = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
-    print(f"Database: {prev_event_count} events, {prev_market_count} markets cached")
-    print()
+        # Check what we already have
+        prev_event_count = conn.execute("SELECT COUNT(*) AS cnt FROM events").fetchone()["cnt"]
+        prev_market_count = conn.execute("SELECT COUNT(*) AS cnt FROM markets").fetchone()["cnt"]
+        print(f"Database: {prev_event_count} events, {prev_market_count} markets cached")
+        print()
 
-    # Fetch open markets (always) and closed markets (only if not yet in db)
-    print("Fetching open markets...")
-    open_events = fetch_all_events(closed=False, label="[open] ")
+        # Fetch open markets (always) and closed markets (only if not yet in db)
+        print("Fetching open markets...")
+        open_events = fetch_all_events(closed=False, label="[open] ")
 
-    # Only fetch closed markets we haven't seen yet
-    known_event_ids = set()
-    if prev_event_count > 0:
-        rows = conn.execute("SELECT id FROM events WHERE closed = 1").fetchall()
-        known_event_ids = {r[0] for r in rows}
+        # Only fetch closed markets we haven't seen yet
+        known_event_ids = set()
+        if prev_event_count > 0:
+            rows = conn.execute("SELECT id FROM events WHERE closed = 1").fetchall()
+            known_event_ids = {r["id"] for r in rows}
 
-    print("\nFetching closed/resolved markets...")
-    closed_events = fetch_all_events(closed=True, label="[closed] ")
+        print("\nFetching closed/resolved markets...")
+        closed_events = fetch_all_events(closed=True, label="[closed] ")
 
-    all_events = open_events + closed_events
-    total_markets = sum(len(e.get("markets", [])) for e in all_events)
-    print(f"\nAPI returned {len(all_events)} events with {total_markets} markets.")
-    print(f"  ({len(open_events)} open, {len(closed_events)} closed)")
-    print()
+        all_events = open_events + closed_events
+        total_markets = sum(len(e.get("markets", [])) for e in all_events)
+        print(f"\nAPI returned {len(all_events)} events with {total_markets} markets.")
+        print(f"  ({len(open_events)} open, {len(closed_events)} closed)")
+        print()
 
-    new_events = 0
-    updated_events = 0
-    new_markets = 0
-    updated_markets = 0
-    skipped_events = 0
-    snapshots = 0
+        new_events = 0
+        updated_events = 0
+        new_markets = 0
+        updated_markets = 0
+        skipped_events = 0
+        snapshots = 0
 
-    for event in all_events:
-        is_closed = event.get("closed", False)
+        for event in all_events:
+            is_closed = event.get("closed", False)
 
-        # Skip closed events we already have (their data won't change)
-        if is_closed and event.get("id") in known_event_ids:
-            skipped_events += 1
-            continue
+            # Skip closed events we already have (their data won't change)
+            if is_closed and event.get("id") in known_event_ids:
+                skipped_events += 1
+                continue
 
-        if upsert_event(conn, event, now):
+            upsert_event(conn, event, now)
+            # We can't easily distinguish insert vs update with ON CONFLICT,
+            # so we just count total processed
             new_events += 1
-        else:
-            updated_events += 1
 
-        for market in event.get("markets", []):
-            if upsert_market(conn, market, event["id"], now):
+            for market in event.get("markets", []):
+                upsert_market(conn, market, event["id"], now)
                 new_markets += 1
-            else:
-                updated_markets += 1
 
-            # Only snapshot open markets (closed prices are frozen)
-            if not is_closed:
-                insert_snapshot(conn, market, now)
-                snapshots += 1
+                # Only snapshot open markets (closed prices are frozen)
+                if not is_closed:
+                    insert_snapshot(conn, market, now)
+                    snapshots += 1
 
-    conn.commit()
+        conn.commit()
 
-    # Final counts
-    total_events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    total_markets_db = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
-    total_snapshots = conn.execute("SELECT COUNT(*) FROM price_snapshots").fetchone()[0]
+        # Final counts
+        total_events = conn.execute("SELECT COUNT(*) AS cnt FROM events").fetchone()["cnt"]
+        total_markets_db = conn.execute("SELECT COUNT(*) AS cnt FROM markets").fetchone()["cnt"]
+        total_snapshots = conn.execute("SELECT COUNT(*) AS cnt FROM price_snapshots").fetchone()["cnt"]
 
-    print(f"Events:    {new_events} new, {updated_events} updated, {skipped_events} skipped  (total in db: {total_events})")
-    print(f"Markets:   {new_markets} new, {updated_markets} updated  (total in db: {total_markets_db})")
-    print(f"Snapshots: {snapshots} recorded  (total in db: {total_snapshots})")
-    print(f"\nDatabase saved to {DB_PATH}")
-
-    conn.close()
+        print(f"Events:    {new_events} processed, {skipped_events} skipped  (total in db: {total_events})")
+        print(f"Markets:   {new_markets} processed  (total in db: {total_markets_db})")
+        print(f"Snapshots: {snapshots} recorded  (total in db: {total_snapshots})")
+    finally:
+        return_connection(conn)
 
 
 if __name__ == "__main__":

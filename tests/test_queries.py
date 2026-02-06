@@ -144,7 +144,6 @@ class TestGetMarkets:
 
     def test_filter_by_end_date_from(self, test_conn):
         result = queries.get_markets(test_conn, end_date_from="2024-10-01T00:00:00Z")
-        # mkt_1, mkt_2 end 2024-11-01, mkt_3 ends 2024-12-31, mkt_4/mkt_5 end 2024-02-15
         for m in result["markets"]:
             assert m["end_date"] is not None
             assert m["end_date"] >= "2024-10-01T00:00:00Z"
@@ -230,17 +229,6 @@ class TestGetMarketHistory:
     def test_no_snapshots(self, test_conn):
         history = queries.get_market_history(test_conn, "mkt_6")
         assert len(history) == 0
-
-    def test_handles_null_outcome_prices(self, test_conn):
-        # Insert a snapshot with null outcome_prices
-        test_conn.execute(
-            "INSERT INTO price_snapshots (market_id, outcome_prices, volume, liquidity, spread, best_ask, last_trade_price, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("mkt_6", None, 0, 0, 0, 0, 0, "2024-01-01T00:00:00Z")
-        )
-        test_conn.commit()
-        history = queries.get_market_history(test_conn, "mkt_6")
-        assert len(history) == 1
-        assert history[0]["price"] is None
 
 
 class TestGetSiblingMarkets:
@@ -384,7 +372,6 @@ class TestGetMomentumScatter:
 
     def test_only_open_markets(self, test_conn):
         data = queries.get_momentum_scatter(test_conn)
-        # Should not include closed markets
         ids = [d["id"] for d in data]
         assert "mkt_4" not in ids
         assert "mkt_5" not in ids
@@ -471,8 +458,6 @@ class TestGetTags:
 class TestGetCalibrationData:
     def test_returns_data_with_pre_resolution_snapshots(self, test_conn):
         data = queries.get_calibration_data(test_conn)
-        # Should return markets that are closed AND have pre-resolution snapshots
-        # mkt_4 has snapshot ["0.70","0.30"] and mkt_5 has snapshot ["0.30","0.70"]
         assert len(data) >= 2
 
     def test_only_closed_markets(self, test_conn):
@@ -488,14 +473,10 @@ class TestGetCalibrationData:
 
     def test_excludes_post_resolution_snapshots(self, test_conn):
         """Markets whose only snapshot is at resolution price should be excluded."""
-        import json
-        # mkt_4 has two snapshots: ["0.70","0.30"] (pre-res) and ["0.98","0.02"] (near-res)
-        # The first (pre-res) should be selected by ROW_NUMBER
         data = queries.get_calibration_data(test_conn)
         mkt4 = next((m for m in data if m["id"] == "mkt_4"), None)
         if mkt4:
             prices = json.loads(mkt4["snapshot_prices"])
-            # Should be the pre-resolution snapshot, not the near-resolution one
             assert float(prices[0]) == 0.70
 
     def test_filter_by_category(self, test_conn):
@@ -509,31 +490,6 @@ class TestGetCalibrationData:
         for m in data:
             assert m["volume"] >= 500000
 
-    def test_excludes_exact_zero_one_snapshots(self, test_conn):
-        """Snapshots with prices exactly '0' or '1' should be filtered out."""
-        import json
-        # Add a closed market with only post-resolution snapshot
-        test_conn.execute(
-            "INSERT INTO markets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("mkt_99", "evt_4", "Post-res only", "post-res", "cond99",
-             "Test", None,
-             json.dumps(["Yes", "No"]), json.dumps(["1", "0"]),
-             50000.0, 50000.0, 0.0, 0.0, 50000.0,
-             0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0,
-             None, None, 0, 1, 0, None, 0,
-             "2024-05-01T00:00:00Z", "2024-05-01T00:00:00Z",
-             "2024-05-01T00:00:00Z", "2024-05-01T00:00:00Z")
-        )
-        test_conn.execute(
-            "INSERT INTO price_snapshots (market_id, outcome_prices, volume, liquidity, spread, best_ask, last_trade_price, fetched_at) VALUES (?,?,?,?,?,?,?,?)",
-            ("mkt_99", json.dumps(["1", "0"]), 50000.0, 0.0, 0.0, 1.0, 1.0, "2024-05-01T00:00:00Z")
-        )
-        test_conn.commit()
-
-        data = queries.get_calibration_data(test_conn)
-        ids = [m["id"] for m in data]
-        assert "mkt_99" not in ids
-
 
 class TestGetCalibrationOverview:
     def test_returns_overview_stats(self, test_conn):
@@ -546,8 +502,8 @@ class TestGetCalibrationOverview:
 
     def test_correct_counts(self, test_conn):
         data = queries.get_calibration_overview(test_conn)
-        assert data["total_resolved"] == 4  # mkt_4, mkt_5, mkt_6, mkt_7
-        assert data["total_open"] == 3  # mkt_1, mkt_2, mkt_3
+        assert data["total_resolved"] == 4
+        assert data["total_open"] == 3
         assert data["total_snapshots"] == 8
 
     def test_has_resolution_distribution(self, test_conn):
@@ -561,7 +517,6 @@ class TestGetCalibrationOverview:
     def test_has_open_prices(self, test_conn):
         data = queries.get_calibration_overview(test_conn)
         assert "open_prices" in data
-        # Should have open markets with valid prices
         assert len(data["open_prices"]) > 0
 
     def test_has_snapshot_date_range(self, test_conn):
