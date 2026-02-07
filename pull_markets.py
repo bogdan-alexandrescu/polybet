@@ -297,6 +297,22 @@ def fetch_all_events(page_size=100, closed=None, label=""):
     return all_events
 
 
+def iter_events(page_size=100, closed=None, label=""):
+    """Yield events one page at a time to avoid loading all into memory."""
+    offset = 0
+    total_fetched = 0
+    while True:
+        events = fetch_events(limit=page_size, offset=offset, closed=closed)
+        if not events:
+            break
+        total_fetched += len(events)
+        print(f"  {label}Fetched {total_fetched} events...", flush=True)
+        yield events
+        if len(events) < page_size:
+            break
+        offset += page_size
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------

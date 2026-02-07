@@ -124,8 +124,6 @@
     let eventSource = null;
     let currentJobId = sessionStorage.getItem('refresh_job_id') ? parseInt(sessionStorage.getItem('refresh_job_id')) : null;
     let lastLogLine = parseInt(sessionStorage.getItem('last_log_line') || '0');
-    let fetchedOpenCount = 0;
-    let fetchedClosedCount = 0;
 
     // Auto-unlock if password is stored
     if (password) {
@@ -218,8 +216,6 @@
                 const data = await resp.json();
                 currentJobId = data.job_id;
                 lastLogLine = 0;
-                fetchedOpenCount = 0;
-                fetchedClosedCount = 0;
                 sessionStorage.setItem('refresh_job_id', currentJobId);
                 sessionStorage.setItem('last_log_line', '0');
                 clearTerminal();
@@ -339,95 +335,53 @@
     }
 
     const phaseLabels = {
-        'fetching_open': 'Fetching open events...',
-        'upserting_open': 'Upserting open events & markets...',
-        'fetching_closed': 'Fetching closed events...',
-        'upserting_closed': 'Upserting closed events & markets...',
-        'upserting': 'Processing events & markets...',
+        'open': 'Processing open events...',
+        'closed': 'Processing closed events...',
         'building_tags': 'Rebuilding tag index...',
         'done': 'Refresh complete!',
         'cancelled': 'Refresh cancelled',
         'error': 'Error occurred',
     };
 
-    function parseFetchedCount(logLines) {
-        // Parse "Fetched XXXX events..." from log lines to track fetch progress
-        if (!logLines) return;
-        for (const log of logLines) {
-            const match = log.line.match(/Fetched (\d+) events/);
-            if (match) {
-                const count = parseInt(match[1]);
-                if (log.line.includes('[open]')) fetchedOpenCount = count;
-                else if (log.line.includes('[closed]')) fetchedClosedCount = count;
-            }
-        }
-    }
-
     function calculateProgress(state) {
-        // Phases: fetch_open 0-5%, upsert_open 5-25%, fetch_closed 25-35%, upsert_closed 35-90%, tags 92%, done 100%
+        // Phases: open 0-40%, closed 40-90%, tags 92%, done 100%
         if (state.phase === 'done') return 100;
         if (state.phase === 'error' || state.phase === 'cancelled') return 100;
-        if (state.phase === 'fetching_open') {
-            return Math.min(4, Math.round((fetchedOpenCount / 7000) * 5));
+        if (state.phase === 'open') {
+            // Estimate ~7000 open events
+            const est = Math.min(39, Math.round((state.processed_events / 7000) * 40));
+            return Math.max(1, est);
         }
-        if (state.phase === 'upserting_open') {
-            if (state.total_events > 0) {
-                return 5 + Math.round((state.processed_events / state.total_events) * 20);
-            }
-            return 5;
-        }
-        if (state.phase === 'fetching_closed') {
-            return 25 + Math.min(9, Math.round((fetchedClosedCount / 30000) * 10));
-        }
-        if (state.phase === 'upserting_closed') {
-            if (state.total_events > 0) {
-                return 35 + Math.round((state.processed_events / state.total_events) * 55);
-            }
-            return 35;
-        }
-        if (state.phase === 'upserting') {
-            if (state.total_events > 0) {
-                return 35 + Math.round((state.processed_events / state.total_events) * 55);
-            }
-            return 35;
+        if (state.phase === 'closed') {
+            // Estimate ~28000 closed events total
+            const closedProcessed = state.processed_events;
+            const est = Math.min(49, Math.round((closedProcessed / 35000) * 50));
+            return 40 + est;
         }
         if (state.phase === 'building_tags') return 92;
         return 0;
     }
 
     function updateUI(state) {
-        // Parse fetch counts from log lines before calculating progress
-        parseFetchedCount(state.log_lines);
         const pct = calculateProgress(state);
         const bar = document.getElementById('progressBar');
-        const isFetching = state.phase === 'fetching_open' || state.phase === 'fetching_closed';
-        const isUpserting = state.phase === 'upserting_open' || state.phase === 'upserting_closed' || state.phase === 'upserting';
 
         document.getElementById('phaseLabel').textContent = phaseLabels[state.phase] || state.phase;
         document.getElementById('progressPct').textContent = pct + '%';
-        bar.style.width = Math.max(pct, isFetching ? 2 : 0) + '%';
+        bar.style.width = Math.max(pct, 1) + '%';
 
-        // Toggle striped animation during fetch phases
-        if (isFetching) {
+        // Striped animation while actively processing
+        if (state.running && state.phase !== 'done') {
             bar.classList.add('progress-striped');
         } else {
             bar.classList.remove('progress-striped');
         }
 
-        // Stats: show fetched counts during fetch phases, counters during upsert
-        if (isFetching) {
-            document.getElementById('statEventsLabel').textContent = 'Events Fetched';
-            document.getElementById('statEvents').textContent = (fetchedOpenCount + fetchedClosedCount).toLocaleString();
-            document.getElementById('statMarkets').textContent = '-';
-            document.getElementById('statSnapshots').textContent = '-';
-            document.getElementById('statSkipped').textContent = '-';
-        } else {
-            document.getElementById('statEventsLabel').textContent = 'Events Processed';
-            document.getElementById('statEvents').textContent = (state.processed_events || 0).toLocaleString();
-            document.getElementById('statMarkets').textContent = (state.new_markets || 0).toLocaleString();
-            document.getElementById('statSnapshots').textContent = (state.snapshots || 0).toLocaleString();
-            document.getElementById('statSkipped').textContent = (state.skipped_events || 0).toLocaleString();
-        }
+        document.getElementById('statEventsLabel').textContent = 'Events Processed';
+        document.getElementById('statEvents').textContent = (state.processed_events || 0).toLocaleString();
+        document.getElementById('statMarkets').textContent = (state.new_markets || 0).toLocaleString();
+        document.getElementById('statSnapshots').textContent = (state.snapshots || 0).toLocaleString();
+        document.getElementById('statSkipped').textContent = (state.skipped_events || 0).toLocaleString();
 
         // Append log lines to terminal
         if (state.log_lines && state.log_lines.length > 0) {

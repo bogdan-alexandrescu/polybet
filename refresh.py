@@ -10,7 +10,7 @@ import psycopg
 
 from db import get_connection, return_connection, create_indexes, create_tag_table
 from pull_markets import (
-    fetch_all_events, init_db, upsert_event, upsert_market, insert_snapshot,
+    iter_events, init_db, upsert_event, upsert_market, insert_snapshot,
 )
 
 
@@ -229,7 +229,11 @@ def cleanup_old_data(conn):
 # ---------------------------------------------------------------------------
 
 def run_refresh(source="web"):
-    """Execute a full data refresh with DB-backed progress tracking."""
+    """Execute a full data refresh with DB-backed progress tracking.
+
+    Streams events page-by-page (100 at a time) to keep memory usage constant
+    instead of loading all ~30k+ events into a list.
+    """
     job_id = create_job(source)
     data_conn = None
     state_conn = None
@@ -259,95 +263,77 @@ def run_refresh(source="web"):
             "snapshots": 0,
         }
         flush_interval = 10
-        data_commit_interval = 100
-        total = 0
+        commit_interval = 50
 
-        def upsert_batch(events, known_closed_ids, counter_offset):
-            """Upsert a batch of events, committing incrementally."""
-            nonlocal total
-            for i, event in enumerate(events):
-                if is_cancelled(state_conn, job_id):
-                    data_conn.commit()
-                    update_job(state_conn, job_id, status="cancelled", phase="cancelled",
-                               finished_at=datetime.now(timezone.utc), **counters)
-                    print("Refresh cancelled.")
-                    return False
+        def process_event(event, known_closed_ids):
+            """Process a single event. Returns False if cancelled."""
+            if is_cancelled(state_conn, job_id):
+                data_conn.commit()
+                update_job(state_conn, job_id, status="cancelled", phase="cancelled",
+                           finished_at=datetime.now(timezone.utc), **counters)
+                print("Refresh cancelled.")
+                return False
 
-                is_closed = event.get("closed", False)
+            is_closed = event.get("closed", False)
 
-                if is_closed and event.get("id") in known_closed_ids:
-                    counters["skipped_events"] += 1
-                    counters["processed_events"] += 1
-                    if (i + 1) % flush_interval == 0:
-                        update_job(state_conn, job_id, **counters)
-                    continue
-
-                upsert_event(data_conn, event, now)
-                counters["new_events"] += 1
-
-                for market in event.get("markets", []):
-                    upsert_market(data_conn, market, event["id"], now)
-                    counters["new_markets"] += 1
-
-                    if not is_closed:
-                        insert_snapshot(data_conn, market, now)
-                        counters["snapshots"] += 1
-
+            if is_closed and event.get("id") in known_closed_ids:
+                counters["skipped_events"] += 1
                 counters["processed_events"] += 1
+                return True
 
-                if (i + 1) % data_commit_interval == 0:
-                    data_conn.commit()
-                    print(f"  Committed batch: {counters['processed_events']}/{total} events...")
+            upsert_event(data_conn, event, now)
+            counters["new_events"] += 1
 
-                if (i + 1) % flush_interval == 0:
-                    update_job(state_conn, job_id, **counters)
+            for market in event.get("markets", []):
+                upsert_market(data_conn, market, event["id"], now)
+                counters["new_markets"] += 1
 
-            data_conn.commit()
-            update_job(state_conn, job_id, **counters)
+                if not is_closed:
+                    insert_snapshot(data_conn, market, now)
+                    counters["snapshots"] += 1
+
+            counters["processed_events"] += 1
+
+            if counters["processed_events"] % commit_interval == 0:
+                data_conn.commit()
+                print(f"  Committed: {counters['processed_events']} events, "
+                      f"{counters['new_markets']} markets...")
+
+            if counters["processed_events"] % flush_interval == 0:
+                update_job(state_conn, job_id, **counters)
+
             return True
 
-        # Phase 1: Fetch + upsert open events
-        update_job(state_conn, job_id, phase="fetching_open")
-        print("Fetching open events from Polymarket API...")
-        open_events = fetch_all_events(closed=False, label="[open] ")
+        # Phase 1: Stream + upsert open events (page by page)
+        update_job(state_conn, job_id, phase="open")
+        print("Streaming open events from Polymarket API...")
+        for page in iter_events(closed=False, label="[open] "):
+            for event in page:
+                if not process_event(event, set()):
+                    return
+            # Commit after each page
+            data_conn.commit()
+        update_job(state_conn, job_id, **counters)
+        print(f"Open events done — {counters['new_markets']} markets, "
+              f"{counters['snapshots']} snapshots.")
 
-        if is_cancelled(state_conn, job_id):
-            update_job(state_conn, job_id, status="cancelled", phase="cancelled",
-                       finished_at=datetime.now(timezone.utc))
-            print("Refresh cancelled.")
-            return
-
-        total = len(open_events)
-        update_job(state_conn, job_id, total_events=total, phase="upserting_open")
-        print(f"Upserting {len(open_events)} open events...")
-        if not upsert_batch(open_events, set(), 0):
-            return
-        print(f"Open events committed — {counters['new_markets']} markets now visible.")
-
-        # Phase 2: Fetch + upsert closed events
-        update_job(state_conn, job_id, phase="fetching_closed")
-        print("Fetching closed events from Polymarket API...")
-
-        known_closed_ids = set()
+        # Phase 2: Stream + upsert closed events (page by page)
+        update_job(state_conn, job_id, phase="closed")
+        print("Loading known closed event IDs...")
         rows = data_conn.execute("SELECT id FROM events WHERE closed = 1").fetchall()
         known_closed_ids = {r["id"] for r in rows}
+        print(f"  {len(known_closed_ids)} already in DB, will skip.")
 
-        closed_events = fetch_all_events(closed=True, label="[closed] ")
+        print("Streaming closed events from Polymarket API...")
+        for page in iter_events(closed=True, label="[closed] "):
+            for event in page:
+                if not process_event(event, known_closed_ids):
+                    return
+            data_conn.commit()
+        update_job(state_conn, job_id, **counters)
+        print(f"Closed events done — {counters['processed_events']} total events.")
 
-        if is_cancelled(state_conn, job_id):
-            update_job(state_conn, job_id, status="cancelled", phase="cancelled",
-                       finished_at=datetime.now(timezone.utc))
-            print("Refresh cancelled.")
-            return
-
-        total += len(closed_events)
-        update_job(state_conn, job_id, total_events=total, phase="upserting_closed")
-        print(f"Upserting {len(closed_events)} closed events ({len(known_closed_ids)} already in DB, will skip)...")
-        if not upsert_batch(closed_events, known_closed_ids, len(open_events)):
-            return
-        print(f"Done: {counters['new_events']} events, {counters['new_markets']} markets, {counters['snapshots']} snapshots.")
-
-        # Phase 4: Rebuild tag table
+        # Phase 3: Rebuild tag table
         update_job(state_conn, job_id, phase="building_tags")
         print("Rebuilding indexes and tag table...")
         create_indexes(data_conn)
@@ -357,7 +343,8 @@ def run_refresh(source="web"):
                    status="done", phase="done",
                    finished_at=datetime.now(timezone.utc),
                    **counters)
-        print("Refresh complete!")
+        print(f"Refresh complete! {counters['new_events']} events, "
+              f"{counters['new_markets']} markets, {counters['snapshots']} snapshots.")
 
     except Exception as e:
         try:
