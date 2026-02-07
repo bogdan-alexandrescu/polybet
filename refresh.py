@@ -193,44 +193,30 @@ class LogCapture(io.TextIOBase):
 # ---------------------------------------------------------------------------
 
 def cleanup_old_data(conn):
-    """Delete old refresh logs, old jobs, and duplicate snapshots to free disk space."""
-    # Keep only the last 3 refresh jobs' logs
-    cutoff = conn.execute(
-        "SELECT id FROM refresh_jobs ORDER BY id DESC OFFSET 3 LIMIT 1"
-    ).fetchone()
-    if cutoff:
-        deleted = conn.execute(
-            "DELETE FROM refresh_logs WHERE job_id <= %(cutoff)s",
-            {"cutoff": cutoff["id"]},
-        ).rowcount
-        conn.execute(
-            "DELETE FROM refresh_jobs WHERE id <= %(cutoff)s AND status != 'running'",
-            {"cutoff": cutoff["id"]},
-        )
+    """Free disk space by truncating snapshots and purging old logs.
+
+    TRUNCATE instantly frees disk space (unlike DELETE + VACUUM which only
+    marks pages as reusable within PostgreSQL but doesn't shrink files).
+    """
+    # TRUNCATE snapshots — refresh will recreate them for open markets
+    count = conn.execute("SELECT COUNT(*) AS cnt FROM price_snapshots").fetchone()["cnt"]
+    if count > 0:
+        conn.execute("TRUNCATE price_snapshots")
         conn.commit()
-        if deleted:
-            print(f"  Cleaned up {deleted} old log lines.")
+        print(f"  Truncated {count:,} old snapshots.")
 
-    # Keep only the latest snapshot per market
-    deleted = conn.execute("""
-        DELETE FROM price_snapshots
-        WHERE id NOT IN (
-            SELECT DISTINCT ON (market_id) id
-            FROM price_snapshots
-            ORDER BY market_id, fetched_at DESC
-        )
-    """).rowcount
+    # Purge all old refresh logs and jobs (keep only the current running one)
+    conn.execute("DELETE FROM refresh_logs")
+    conn.execute("DELETE FROM refresh_jobs WHERE status != 'running'")
     conn.commit()
-    if deleted:
-        print(f"  Cleaned up {deleted} old snapshots.")
+    print("  Purged old refresh logs and jobs.")
 
-    # VACUUM to reclaim disk space
+    # VACUUM FULL to reclaim disk space from the deletes
     old_autocommit = conn.autocommit
     conn.autocommit = True
     try:
-        conn.execute("VACUUM refresh_logs")
-        conn.execute("VACUUM refresh_jobs")
-        conn.execute("VACUUM price_snapshots")
+        conn.execute("VACUUM FULL refresh_logs")
+        conn.execute("VACUUM FULL refresh_jobs")
         print("  Vacuumed tables.")
     except Exception as e:
         print(f"  VACUUM warning: {e}")
