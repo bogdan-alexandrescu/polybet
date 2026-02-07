@@ -35,6 +35,10 @@ def get_connection():
 
 def return_connection(conn):
     """Return a connection to the pool."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
     get_pool().putconn(conn)
 
 
