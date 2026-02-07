@@ -6,6 +6,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import psycopg
+
 from db import get_connection, return_connection, create_indexes, create_tag_table
 from pull_markets import (
     fetch_all_events, init_db, upsert_event, upsert_market, insert_snapshot,
@@ -187,6 +189,56 @@ class LogCapture(io.TextIOBase):
 
 
 # ---------------------------------------------------------------------------
+# Cleanup — free disk space before each refresh
+# ---------------------------------------------------------------------------
+
+def cleanup_old_data(conn):
+    """Delete old refresh logs, old jobs, and duplicate snapshots to free disk space."""
+    # Keep only the last 3 refresh jobs' logs
+    cutoff = conn.execute(
+        "SELECT id FROM refresh_jobs ORDER BY id DESC OFFSET 3 LIMIT 1"
+    ).fetchone()
+    if cutoff:
+        deleted = conn.execute(
+            "DELETE FROM refresh_logs WHERE job_id <= %(cutoff)s",
+            {"cutoff": cutoff["id"]},
+        ).rowcount
+        conn.execute(
+            "DELETE FROM refresh_jobs WHERE id <= %(cutoff)s AND status != 'running'",
+            {"cutoff": cutoff["id"]},
+        )
+        conn.commit()
+        if deleted:
+            print(f"  Cleaned up {deleted} old log lines.")
+
+    # Keep only the latest snapshot per market
+    deleted = conn.execute("""
+        DELETE FROM price_snapshots
+        WHERE id NOT IN (
+            SELECT DISTINCT ON (market_id) id
+            FROM price_snapshots
+            ORDER BY market_id, fetched_at DESC
+        )
+    """).rowcount
+    conn.commit()
+    if deleted:
+        print(f"  Cleaned up {deleted} old snapshots.")
+
+    # VACUUM to reclaim disk space
+    old_autocommit = conn.autocommit
+    conn.autocommit = True
+    try:
+        conn.execute("VACUUM refresh_logs")
+        conn.execute("VACUUM refresh_jobs")
+        conn.execute("VACUUM price_snapshots")
+        print("  Vacuumed tables.")
+    except Exception as e:
+        print(f"  VACUUM warning: {e}")
+    finally:
+        conn.autocommit = old_autocommit
+
+
+# ---------------------------------------------------------------------------
 # Main refresh function
 # ---------------------------------------------------------------------------
 
@@ -205,6 +257,10 @@ def run_refresh(source="web"):
         sys.stdout = LogCapture(original_stdout, state_conn, job_id)
 
         init_db(data_conn)
+
+        # Cleanup old data to free disk space
+        print("Cleaning up old data...")
+        cleanup_old_data(data_conn)
 
         now = datetime.now(timezone.utc).isoformat()
         counters = {
